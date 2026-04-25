@@ -50,25 +50,43 @@ def _get_drive_service_local(client_secret_path: str, token_path: str):
 
 def _get_drive_service_cloud():
     """
-    Cloud Run: Service Account authentication.
+    Headless (Cloud Run / GitHub Actions) Drive authentication.
 
-    The SERVICE_ACCOUNT_JSON env var should contain the raw contents of
-    your service_account.json key file. Share your Drive folder with the
-    service account email to grant upload access.
+    Preference order:
+      1. DRIVE_TOKEN_JSON — user OAuth token (recommended; has Drive quota).
+         Generate once locally with: python scripts/generate_drive_token.py
+      2. SERVICE_ACCOUNT_JSON — service account key (only works with Shared Drives).
+
+    Service accounts have no personal Drive storage quota, so user OAuth
+    is the correct approach for uploading to a regular My Drive folder.
     """
-    if not config.SERVICE_ACCOUNT_JSON:
-        raise EnvironmentError(
-            "Cloud Run requires SERVICE_ACCOUNT_JSON env var. "
-            "Download a service account key and store it in Secret Manager."
+    if config.DRIVE_TOKEN_JSON:
+        logger.info("Drive: authenticating with user OAuth token (DRIVE_TOKEN_JSON).")
+        from google.auth.transport.requests import Request as AuthRequest
+        token_data = json.loads(config.DRIVE_TOKEN_JSON)
+        creds = Credentials.from_authorized_user_info(token_data, DRIVE_SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(AuthRequest())
+            logger.info("Drive token refreshed.")
+        return build("drive", "v3", credentials=creds)
+
+    if config.SERVICE_ACCOUNT_JSON:
+        logger.warning(
+            "Drive: using service account — this only works with Shared Drives. "
+            "Set DRIVE_TOKEN_JSON for regular My Drive uploads."
         )
+        from google.oauth2 import service_account
+        sa_info = json.loads(config.SERVICE_ACCOUNT_JSON)
+        creds   = service_account.Credentials.from_service_account_info(
+            sa_info, scopes=DRIVE_SCOPES
+        )
+        return build("drive", "v3", credentials=creds)
 
-    from google.oauth2 import service_account
-
-    sa_info = json.loads(config.SERVICE_ACCOUNT_JSON)
-    creds   = service_account.Credentials.from_service_account_info(
-        sa_info, scopes=DRIVE_SCOPES
+    raise EnvironmentError(
+        "Headless Drive auth requires either DRIVE_TOKEN_JSON (user OAuth) "
+        "or SERVICE_ACCOUNT_JSON (service account for Shared Drives). "
+        "Run: python scripts/generate_drive_token.py to create DRIVE_TOKEN_JSON."
     )
-    return build("drive", "v3", credentials=creds)
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────

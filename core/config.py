@@ -46,6 +46,7 @@ SERVICE_ACCOUNT_PATH = os.path.join(_CREDS_DIR, "service_account.json")
 # Each holds the raw JSON string of the corresponding credential file.
 GMAIL_TOKEN_JSON     = os.environ.get("GMAIL_TOKEN_JSON", "")       # contents of token.json
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON", "")   # contents of service_account.json
+DRIVE_TOKEN_JSON     = os.environ.get("DRIVE_TOKEN_JSON", "")        # contents of drive_token.json (user OAuth for Drive)
 
 # ─── Gmail ────────────────────────────────────────────────────────────────────
 GMAIL_SCOPES         = ["https://www.googleapis.com/auth/gmail.readonly"]
