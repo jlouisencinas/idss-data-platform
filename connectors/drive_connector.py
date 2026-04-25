@@ -4,8 +4,9 @@ connectors/drive_connector.py
 CLOUD LAYER — Google Drive API v3 integration.
 
 Auth strategy:
-  Local     → OAuth2 browser flow; token cached to drive_token.json
-  Cloud Run → Service Account from SERVICE_ACCOUNT_JSON environment variable
+  Local          → OAuth2 browser flow; token cached to drive_token.json
+  Cloud Run      → Service Account from SERVICE_ACCOUNT_JSON environment variable
+  GitHub Actions → Same as Cloud Run (GITHUB_ACTIONS env var detected)
 """
 
 import json
@@ -87,7 +88,7 @@ def upload_file(
 
     Returns the uploaded file name.
     """
-    if config.IS_CLOUD_RUN:
+    if config.IS_HEADLESS:
         service = _get_drive_service_cloud()
     else:
         service = _get_drive_service_local(client_secret_path, cred_path)

@@ -1,0 +1,49 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .github/workflows/idss-pipeline.yml
+#
+# Runs the IDSS Data Platform pipeline on a daily schedule.
+# Triggers: daily at 8 AM Manila time (UTC+8 = 00:00 UTC)
+#           manual dispatch (Actions tab → Run workflow)
+#
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   GMAIL_TOKEN_JSON     — contents of your local token.json
+#   SERVICE_ACCOUNT_JSON — contents of your service_account.json
+#   DRIVE_FOLDER_ID      — Google Drive target folder ID
+#   WEBAPP_URL           — Google Apps Script Web App URL
+#   ANTHROPIC_API_KEY    — (optional) Claude API key for AI validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: IDSS Pipeline
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 8 AM Manila time (UTC+8)
+  workflow_dispatch:        # allow manual runs from the Actions tab
+
+jobs:
+  run-pipeline:
+    name: Run IDSS Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          GMAIL_TOKEN_JSON:     ${{ secrets.GMAIL_TOKEN_JSON }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          DRIVE_FOLDER_ID:      ${{ secrets.DRIVE_FOLDER_ID }}
+          WEBAPP_URL:           ${{ secrets.WEBAPP_URL }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python main.py

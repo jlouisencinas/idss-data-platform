@@ -13,9 +13,16 @@ Cloud Run automatically sets the K_SERVICE environment variable.
 import os
 
 # ─── Environment ──────────────────────────────────────────────────────────────
-# Cloud Run sets K_SERVICE automatically; used to detect the runtime environment
-IS_CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
-ENV_NAME     = "cloud-run" if IS_CLOUD_RUN else "local"
+# Cloud Run sets K_SERVICE; GitHub Actions sets GITHUB_ACTIONS=true.
+# Both are headless — credentials come from env vars, not local files.
+IS_CLOUD_RUN      = bool(os.environ.get("K_SERVICE"))
+IS_GITHUB_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
+IS_HEADLESS       = IS_CLOUD_RUN or IS_GITHUB_ACTIONS
+ENV_NAME = (
+    "cloud-run"      if IS_CLOUD_RUN      else
+    "github-actions" if IS_GITHUB_ACTIONS else
+    "local"
+)
 
 # ─── Paths (same in both environments) ────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -4,9 +4,9 @@ connectors/gmail_connector.py
 CLOUD LAYER — Gmail API integration.
 
 Auth strategy:
-  Local     → OAuth2 browser flow; tokens cached to token.json
-  Cloud Run → Token loaded from GMAIL_TOKEN_JSON environment variable
-              (export your local token.json content into that secret)
+  Local          → OAuth2 browser flow; tokens cached to token.json
+  Cloud Run      → Token loaded from GMAIL_TOKEN_JSON environment variable
+  GitHub Actions → Same as Cloud Run (GITHUB_ACTIONS env var detected)
 """
 
 import base64
@@ -45,7 +45,7 @@ def get_gmail_service(credentials_path: str, token_path: str, scopes: list):
     Local:      Standard OAuth2 file flow (opens browser on first run).
     Cloud Run:  Loads token from GMAIL_TOKEN_JSON env var — no browser needed.
     """
-    if config.IS_CLOUD_RUN:
+    if config.IS_HEADLESS:
         return _get_gmail_service_cloud(scopes)
     return _get_gmail_service_local(credentials_path, token_path, scopes)
 
