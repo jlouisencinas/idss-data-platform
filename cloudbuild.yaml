@@ -1,0 +1,60 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# cloudbuild.yaml — Google Cloud Build pipeline
+#
+# Triggered manually or on git push to main branch.
+# Builds the Docker image, pushes to Artifact Registry, and deploys/updates
+# the Cloud Run Job.
+#
+# Required substitutions (set in Cloud Build trigger or pass via --substitutions):
+#   _REGION   — e.g. asia-southeast1
+#   _PROJECT  — your GCP project ID (auto-set as $PROJECT_ID)
+#   _IMAGE    — image name, e.g. idss-pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+substitutions:
+  _REGION: asia-southeast1
+  _IMAGE: idss-pipeline
+  _JOB_NAME: idss-pipeline-job
+
+steps:
+  # Step 1 — Build the Docker image
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_IMAGE/$_IMAGE:$COMMIT_SHA
+      - -t
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_IMAGE/$_IMAGE:latest
+      - .
+
+  # Step 2 — Push to Artifact Registry
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_IMAGE/$_IMAGE
+
+  # Step 3 — Deploy / update Cloud Run Job
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - $_JOB_NAME
+      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/$_IMAGE/$_IMAGE:$COMMIT_SHA
+      - --region=$_REGION
+      - --task-timeout=3600
+      - --max-retries=1
+      - --set-secrets=GMAIL_TOKEN_JSON=gmail-token-json:latest
+      - --set-secrets=SERVICE_ACCOUNT_JSON=service-account-json:latest
+      - --set-secrets=ANTHROPIC_API_KEY=anthropic-api-key:latest
+      - --set-env-vars=DRIVE_FOLDER_ID=1O00CGI9zSzsbGK4S_n3bTAehJ-TUcvrX
+      - --set-env-vars=WEBAPP_URL=https://script.google.com/macros/s/AKfycbzH2cXnuP8AVeMSrJKGqI0iHqjSZ90SdbbNWsNDsBIr1oDb-XTys-M8n1wpU_oMjnX6/exec
+
+images:
+  - $_REGION-docker.pkg.dev/$PROJECT_ID/$_IMAGE/$_IMAGE:$COMMIT_SHA
+  - $_REGION-docker.pkg.dev/$PROJECT_ID/$_IMAGE/$_IMAGE:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY

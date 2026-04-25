@@ -1,0 +1,19 @@
+# IDSS Data Platform — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Google Cloud / APIs (already in venv) ────────────────────────────────────
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+
+# ── Data Processing (already in venv) ────────────────────────────────────────
+pandas>=2.0.0
+pdfplumber>=0.10.0
+
+# ── Utilities (already in venv) ──────────────────────────────────────────────
+requests>=2.31.0
+
+# ── AI (optional — enables --ai flag and smart extraction) ───────────────────
+# pip install anthropic
+anthropic>=0.30.0

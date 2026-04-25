@@ -1,0 +1,25 @@
+# Credentials — never baked into the image
+*.json
+.env
+.env.*
+
+# Virtual environment — pip install runs inside the container
+venv/
+.venv/
+
+# Git history — not needed in the image
+.git/
+.gitignore
+
+# Generated data — mounted or created at runtime
+data/
+logs/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
