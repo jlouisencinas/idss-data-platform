@@ -13,6 +13,11 @@ pdfplumber>=0.10.0
 
 # ── Utilities (already in venv) ──────────────────────────────────────────────
 requests>=2.31.0
+python-dotenv>=1.0.0
+
+# ── Browser automation — PRISM agent enrichment ───────────────────────────────
+# After install, run: playwright install chromium
+playwright>=1.40.0
 
 # ── AI (optional — enables --ai flag and smart extraction) ───────────────────
 # pip install anthropic

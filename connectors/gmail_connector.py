@@ -196,6 +196,117 @@ def _download_single_attachment(service, msg_id: str, part: dict, folder: str, r
     return None
 
 
+# ─── PRISM OTP ───────────────────────────────────────────────────────────────
+
+def get_otp_gmail_service(scopes: list = None):
+    """
+    Build a Gmail API service for the PRISM OTP account (plukfloroespiritu).
+
+    Uses PRISM_OTP_TOKEN_JSON env var — the JSON contents of an OAuth2 token
+    generated for the plukfloroespiritu Gmail account.
+
+    Run scripts/generate_prism_otp_token.py once locally to create it,
+    then add the file contents as GitHub Secret PRISM_OTP_TOKEN_JSON.
+    """
+    if scopes is None:
+        scopes = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+    otp_token_json = os.environ.get("PRISM_OTP_TOKEN_JSON", "")
+    if not otp_token_json:
+        raise EnvironmentError(
+            "PRISM_OTP_TOKEN_JSON is required to read PRISM OTP emails. "
+            "Run scripts/generate_prism_otp_token.py to generate the token, "
+            "then set it in .env or as a GitHub Secret."
+        )
+
+    token_data = json.loads(otp_token_json)
+    creds = Credentials.from_authorized_user_info(token_data, scopes)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        logger.info("PRISM OTP Gmail token refreshed.")
+
+    return build("gmail", "v1", credentials=creds)
+
+
+def read_prism_otp(otp_service, max_wait_seconds: int = 90) -> str | None:
+    """
+    Poll the PRISM OTP Gmail inbox until the 6-digit OTP code arrives.
+
+    Searches for the most recent email with subject "PRISM" sent within
+    the last 3 minutes. Retries every 5 seconds up to max_wait_seconds.
+
+    Args:
+        otp_service:       Authenticated Gmail service for the OTP account.
+        max_wait_seconds:  How long to wait before giving up (default 90s).
+
+    Returns:
+        The 6-digit OTP string, or None if not found in time.
+    """
+    import base64 as _b64
+
+    deadline = time.time() + max_wait_seconds
+    logger.info(f"Waiting up to {max_wait_seconds}s for PRISM OTP email...")
+
+    while time.time() < deadline:
+        try:
+            results = otp_service.users().messages().list(
+                userId="me",
+                q="subject:PRISM newer_than:3m",
+                maxResults=3,
+            ).execute()
+
+            for msg_meta in results.get("messages", []):
+                msg = otp_service.users().messages().get(
+                    userId="me",
+                    id=msg_meta["id"],
+                    format="full",
+                ).execute()
+
+                body_text = _extract_email_body(msg)
+                match = re.search(r"\b(\d{6})\b", body_text)
+                if match:
+                    otp = match.group(1)
+                    logger.info(f"PRISM OTP found: {otp}")
+                    return otp
+
+        except HttpError as e:
+            logger.warning(f"Error polling OTP inbox: {e}")
+
+        time.sleep(5)
+
+    logger.error(f"PRISM OTP not found after {max_wait_seconds}s.")
+    return None
+
+
+def _extract_email_body(message: dict) -> str:
+    """Extract plain-text body from a Gmail message dict."""
+    import base64 as _b64
+
+    payload = message.get("payload", {})
+
+    def _decode(data: str) -> str:
+        try:
+            return _b64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    # Single-part message
+    body_data = payload.get("body", {}).get("data", "")
+    if body_data:
+        return _decode(body_data)
+
+    # Multi-part — walk parts looking for text/plain
+    for part in payload.get("parts", []):
+        if part.get("mimeType") == "text/plain":
+            return _decode(part.get("body", {}).get("data", ""))
+
+    # Fallback: join all part data
+    return " ".join(
+        _decode(p.get("body", {}).get("data", ""))
+        for p in payload.get("parts", [])
+    )
+
+
 def download_latest_zips(service, message_ids: list, folder: str, max_workers: int = 3) -> list:
     """Download ZIP attachments from all message IDs. Parallel per message."""
     downloaded = []

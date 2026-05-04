@@ -5,12 +5,23 @@ Central configuration for the IDSS Data Platform.
 
 Environment detection:
   - Local  → credentials loaded from the file system (IDSS Automation folder)
+              + environment variables loaded from .env (via python-dotenv)
   - Cloud Run → credentials loaded from environment variables / Secret Manager
 
 Cloud Run automatically sets the K_SERVICE environment variable.
+
+To update the Apps Script deployment ID locally:
+  1. Edit WEBAPP_URL in .env
+  2. Update the WEBAPP_URL secret in GitHub Actions (Settings → Secrets → Actions)
 """
 
 import os
+
+from dotenv import load_dotenv
+
+# Load .env for local development (no-op in CI/GitHub Actions where env vars
+# are already injected; safe to call regardless of environment).
+load_dotenv()
 
 # ─── Environment ──────────────────────────────────────────────────────────────
 # Cloud Run sets K_SERVICE; GitHub Actions sets GITHUB_ACTIONS=true.
@@ -60,15 +71,35 @@ PARALLEL_WORKERS     = 3
 ZIP_PASSWORD = b"5fb85964"
 
 # ─── Google Drive ─────────────────────────────────────────────────────────────
-DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "1O00CGI9zSzsbGK4S_n3bTAehJ-TUcvrX")
+# Set in .env (local) or GitHub Secret DRIVE_FOLDER_ID (CI)
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
 DRIVE_SCOPES    = ["https://www.googleapis.com/auth/drive.file"]
 
 # ─── Google Apps Script ───────────────────────────────────────────────────────
-WEBAPP_URL = os.environ.get(
-    "WEBAPP_URL",
-    "https://script.google.com/macros/s/"
-    "AKfycbzH2cXnuP8AVeMSrJKGqI0iHqjSZ90SdbbNWsNDsBIr1oDb-XTys-M8n1wpU_oMjnX6/exec",
-)
+# Set in .env (local) or GitHub Secret WEBAPP_URL (CI).
+# Format: https://script.google.com/macros/s/<DEPLOYMENT_ID>/exec
+# ⚠️  Update BOTH .env AND the GitHub Secret whenever the Apps Script
+#     is redeployed with a NEW deployment (new deployment ID).
+#     To keep the ID stable: always redeploy to the EXISTING deployment
+#     in Apps Script → Manage Deployments → Edit (pencil icon) → Deploy.
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
+
+# ─── Google Sheets ────────────────────────────────────────────────────────────
+# The ID from the spreadsheet URL:
+# https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit
+# ⚠️  Share the sheet with your service account email (Editor access).
+#     Find the SA email in SERVICE_ACCOUNT_JSON under "client_email".
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
+
+# ─── PRISM Portal ─────────────────────────────────────────────────────────────
+# Credentials for https://prism.prulifeuk.com.ph
+PRISM_USERNAME = os.environ.get("PRISM_USERNAME", "")
+PRISM_PASSWORD = os.environ.get("PRISM_PASSWORD", "")
+
+# Gmail OAuth2 token for the plukfloroespiritu account that receives OTP emails.
+# Generate once locally with: python scripts/generate_prism_otp_token.py
+# Then add file contents as GitHub Secret PRISM_OTP_TOKEN_JSON.
+PRISM_OTP_TOKEN_JSON = os.environ.get("PRISM_OTP_TOKEN_JSON", "")
 
 # ─── AI ───────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")

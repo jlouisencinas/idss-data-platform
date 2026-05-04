@@ -4,6 +4,7 @@ token*.json
 drive_token.json
 client_secrets.json
 service_account.json
+prism_otp_token.json
 *.p12
 *.pem
 
