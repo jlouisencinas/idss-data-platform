@@ -1129,26 +1129,33 @@ def run_prism_update(
                         result["errors"].append({"agent_code": agent_code, "error": f"Retry failed: {retry_err}"})
 
                 except PlaywrightTimeoutError as e:
-                    logger.error(f"Timeout processing agent {agent_code}: {e}")
-                    mark_pending_agent_done(spreadsheet_id, sheet_row, "ERROR")
+                    # Transient: PRISM was slow / page rendered late. Re-queue for
+                    # the next workflow run instead of marking ERROR.
+                    logger.warning(f"Timeout for agent {agent_code} — re-queueing as PENDING: {e}")
+                    mark_pending_agent_done(spreadsheet_id, sheet_row, "PENDING")
                     result["errors"].append({
                         "agent_code": agent_code,
-                        "error": f"Page timeout: {e}",
+                        "error": f"Page timeout (re-queued): {e}",
                     })
                 except PlaywrightError as e:
                     # Covers "Target page, context or browser has been closed"
-                    # and other Playwright runtime errors.  If the browser is gone
-                    # there is no point processing any more agents — break out.
-                    err_msg = str(e).splitlines()[0]  # first line is enough
-                    logger.error(f"Browser/page error for {agent_code}: {err_msg}")
-                    mark_pending_agent_done(spreadsheet_id, sheet_row, "ERROR")
+                    # and other Playwright runtime errors. Browser-closed is
+                    # environmental (CI runner glitch) → re-queue. Other Playwright
+                    # errors are likely programmatic → keep as ERROR for visibility.
+                    err_msg = str(e).splitlines()[0]
+                    browser_gone = "closed" in err_msg.lower()
+                    status = "PENDING" if browser_gone else "ERROR"
+                    logger.error(
+                        f"Browser/page error for {agent_code} (marking {status}): {err_msg}"
+                    )
+                    mark_pending_agent_done(spreadsheet_id, sheet_row, status)
                     result["errors"].append({
                         "agent_code": agent_code,
                         "error": err_msg,
                     })
-                    if "closed" in err_msg.lower():
+                    if browser_gone:
                         logger.error("Browser context is gone — aborting remaining agents.")
-                        # Mark all remaining agents as errored
+                        # Re-queue remaining (untried) agents so the next run picks them up.
                         remaining = [
                             a for a in pending
                             if a["agent_code"] not in
@@ -1156,13 +1163,15 @@ def run_prism_update(
                             and a["agent_code"] != agent_code
                         ]
                         for rem in remaining:
-                            mark_pending_agent_done(spreadsheet_id, rem["sheet_row"], "ERROR")
+                            mark_pending_agent_done(spreadsheet_id, rem["sheet_row"], "PENDING")
                             result["errors"].append({
                                 "agent_code": rem["agent_code"],
-                                "error": "Aborted — browser closed",
+                                "error": "Aborted — browser closed (re-queued)",
                             })
                         break
                 except Exception as e:
+                    # Unknown failure — keep as ERROR so it stays visible rather
+                    # than silently retrying every run.
                     logger.error(f"Unexpected error for agent {agent_code}: {e}")
                     mark_pending_agent_done(spreadsheet_id, sheet_row, "ERROR")
                     result["errors"].append({
