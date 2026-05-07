@@ -480,7 +480,9 @@ class PrismPage:
         time.sleep(0.3)
 
         # ── Step 3: Mouse-click "Agent code" inside cmp.picker.el.dom ───────
-        agent_code_item_pos = self.page.evaluate(f"""
+        # Retry up to 3 times — Ext's bound list sometimes hasn't fully bound
+        # its click handlers in the brief moment after the picker is "visible".
+        find_item_js = f"""
             () => {{
                 try {{
                     const cmp = {get_visible_cmp_js};
@@ -503,21 +505,8 @@ class PrismPage:
                     return null;
                 }} catch(e) {{ return null; }}
             }}
-        """)
-        if not agent_code_item_pos:
-            raise RuntimeError("'Agent code' item not found in searchBy picker.")
-        logger.info(f"Agent code item rect: {agent_code_item_pos.get('rect')}")
-
-        self.page.mouse.click(agent_code_item_pos['x'], agent_code_item_pos['y'])
-        logger.info(
-            f"Mouse-clicked dropdown item '{agent_code_item_pos['text']}' "
-            f"at ({agent_code_item_pos['x']:.0f}, {agent_code_item_pos['y']:.0f})"
-        )
-
-        time.sleep(0.5)   # let PRISM's change handler run
-
-        # Verify by reading the visible searchBy combo state
-        combo_state = self.page.evaluate(f"""
+        """
+        read_state_js = f"""
             () => {{
                 try {{
                     const cmp = {get_visible_cmp_js};
@@ -529,10 +518,54 @@ class PrismPage:
                     }};
                 }} catch(e) {{ return {{err: 'ex:' + e.message}}; }}
             }}
-        """)
-        logger.info(f"searchBy combo state: {combo_state}")
+        """
+
+        combo_state = None
+        for attempt in range(3):
+            agent_code_item_pos = self.page.evaluate(find_item_js)
+            if not agent_code_item_pos:
+                # Picker may have closed — re-expand and try once more
+                logger.warning(
+                    f"Attempt {attempt + 1}: 'Agent code' item not found — re-expanding picker."
+                )
+                self.page.evaluate(
+                    f"() => {{ const cmp = {get_visible_cmp_js}; if (cmp) cmp.expand(); }}"
+                )
+                self.page.wait_for_function(picker_visible_check, timeout=3_000)
+                time.sleep(0.3)
+                continue
+
+            if attempt == 0:
+                logger.info(f"Agent code item rect: {agent_code_item_pos.get('rect')}")
+
+            self.page.mouse.click(agent_code_item_pos['x'], agent_code_item_pos['y'])
+            logger.info(
+                f"Attempt {attempt + 1}: mouse-clicked '{agent_code_item_pos['text']}' "
+                f"at ({agent_code_item_pos['x']:.0f}, {agent_code_item_pos['y']:.0f})"
+            )
+            time.sleep(0.6)   # let PRISM's change handler run
+
+            combo_state = self.page.evaluate(read_state_js)
+            if combo_state and combo_state.get('rawValue'):
+                logger.info(f"searchBy combo state: {combo_state}")
+                break
+
+            logger.warning(
+                f"Attempt {attempt + 1}: combo did not register "
+                f"({combo_state}) — re-expanding and retrying."
+            )
+            # Re-expand for the next attempt
+            self.page.evaluate(
+                f"() => {{ const cmp = {get_visible_cmp_js}; if (cmp) cmp.expand(); }}"
+            )
+            try:
+                self.page.wait_for_function(picker_visible_check, timeout=3_000)
+            except PlaywrightTimeoutError:
+                pass
+            time.sleep(0.3)
+
         if not combo_state or combo_state.get('err') or not combo_state.get('rawValue'):
-            raise RuntimeError(f"searchBy combo did not register selection: {combo_state}")
+            raise RuntimeError(f"searchBy combo did not register selection after 3 attempts: {combo_state}")
 
         # ── Step 4: Set keyword via Ext JS API ───────────────────────────────
         # The keyword field is readonly in the DOM (Ext JS manages it), so
