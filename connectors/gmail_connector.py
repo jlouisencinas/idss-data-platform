@@ -228,22 +228,29 @@ def get_otp_gmail_service(scopes: list = None):
     return build("gmail", "v1", credentials=creds)
 
 
-def read_prism_otp(otp_service, max_wait_seconds: int = 90) -> str | None:
+def read_prism_otp(
+    otp_service,
+    max_wait_seconds: int = 90,
+    poll_start_ms: int = None,
+) -> str | None:
     """
     Poll the PRISM OTP Gmail inbox until the 6-digit OTP code arrives.
 
-    Searches for the most recent email with subject "PRISM" sent within
-    the last 3 minutes. Retries every 5 seconds up to max_wait_seconds.
+    Only accepts emails that arrived AFTER poll_start_ms (milliseconds).
+    Pass poll_start_ms recorded just before requesting the OTP so emails
+    that arrive before polling starts are still caught.
 
     Args:
         otp_service:       Authenticated Gmail service for the OTP account.
         max_wait_seconds:  How long to wait before giving up (default 90s).
+        poll_start_ms:     Epoch ms cutoff — only accept emails after this.
+                           Defaults to now() if not provided.
 
     Returns:
         The 6-digit OTP string, or None if not found in time.
     """
-    import base64 as _b64
-
+    if poll_start_ms is None:
+        poll_start_ms = int(time.time() * 1000)
     deadline = time.time() + max_wait_seconds
     logger.info(f"Waiting up to {max_wait_seconds}s for PRISM OTP email...")
 
@@ -251,10 +258,12 @@ def read_prism_otp(otp_service, max_wait_seconds: int = 90) -> str | None:
         try:
             results = otp_service.users().messages().list(
                 userId="me",
-                q="subject:PRISM newer_than:3m",
-                maxResults=3,
+                q="subject:PRISM newer_than:5m",
+                maxResults=10,
             ).execute()
 
+            # Collect candidates that arrived after polling started
+            candidates = []
             for msg_meta in results.get("messages", []):
                 msg = otp_service.users().messages().get(
                     userId="me",
@@ -262,12 +271,21 @@ def read_prism_otp(otp_service, max_wait_seconds: int = 90) -> str | None:
                     format="full",
                 ).execute()
 
+                internal_date = int(msg.get("internalDate", 0))
+                if internal_date < poll_start_ms:
+                    continue  # skip emails that pre-date this login attempt
+
                 body_text = _extract_email_body(msg)
                 match = re.search(r"\b(\d{6})\b", body_text)
                 if match:
-                    otp = match.group(1)
-                    logger.info(f"PRISM OTP found: {otp}")
-                    return otp
+                    candidates.append((internal_date, match.group(1)))
+
+            if candidates:
+                # Pick the OTP from the most recently received email
+                candidates.sort(reverse=True)
+                otp = candidates[0][1]
+                logger.info(f"PRISM OTP found: {otp}")
+                return otp
 
         except HttpError as e:
             logger.warning(f"Error polling OTP inbox: {e}")

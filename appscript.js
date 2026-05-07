@@ -222,11 +222,54 @@ function appendUnknownAgentsToDatabase() {
   } else {
     Logger.log("No new UNKNOWN agents to insert.");
 
-    // Clear any stale PENDING_PRISM_UPDATE from a previous run
+    // Even with no new agents, we may need to REBUILD the pending queue.
+    // Scenario: a previous run added agents with BRANCH="FOR_DB_UPDATE" but
+    // PENDING_PRISM_UPDATE was cleared before PRISM automation finished.
     const pendingSheet = ss.getSheetByName("PENDING_PRISM_UPDATE");
+
+    // Check whether any PENDING rows already exist in the queue
+    let hasPending = false;
     if (pendingSheet) {
-      pendingSheet.clearContents();
-      Logger.log("Cleared stale PENDING_PRISM_UPDATE sheet.");
+      const pendingData = pendingSheet.getDataRange().getValues();
+      hasPending = pendingData.slice(1).some(r => String(r[2]).trim() === "PENDING");
+    }
+
+    if (hasPending) {
+      // PRISM automation is still running — leave the sheet alone
+      Logger.log("PENDING_PRISM_UPDATE has unprocessed agents — skipping clear.");
+    } else {
+      // No active pending rows — check Database for agents still tagged FOR_DB_UPDATE
+      const forUpdateAgents = dbData.slice(1).filter(
+        r => String(r[unitColInDB]).trim() === "FOR_DB_UPDATE"
+      );
+
+      if (forUpdateAgents.length > 0) {
+        // Rebuild PENDING_PRISM_UPDATE so PRISM automation can pick them up
+        const sheet = pendingSheet || ss.insertSheet("PENDING_PRISM_UPDATE");
+        sheet.clearContents();
+
+        sheet.getRange(1, 1, 1, 3).setValues([["AGENT CODE", "AGENT NAME", "STATUS"]]);
+
+        const pendingRows = forUpdateAgents.map(r => [
+          r[agentCodeCol],
+          r[agentNameCol],
+          "PENDING"
+        ]);
+        sheet.getRange(2, 1, pendingRows.length, 3).setValues(pendingRows);
+
+        sheet.getRange(1, 1, 1, 3)
+          .setBackground("#c9000a")
+          .setFontColor("#ffffff")
+          .setFontWeight("bold");
+
+        Logger.log(`Rebuilt PENDING_PRISM_UPDATE with ${pendingRows.length} FOR_DB_UPDATE agent(s).`);
+      } else {
+        // No FOR_DB_UPDATE agents and no pending rows — safe to clear any stale sheet
+        if (pendingSheet) {
+          pendingSheet.clearContents();
+          Logger.log("Cleared completed PENDING_PRISM_UPDATE sheet (all done, nothing pending).");
+        }
+      }
     }
   }
 
