@@ -42,6 +42,10 @@ class SessionExpiredError(Exception):
     """Raised when PRISM shows a Session Timeout dialog mid-processing."""
 
 
+class AgentNotFoundInPrismError(Exception):
+    """Raised when PRISM shows a 'no record' dialog after a search — the agent code does not exist in PRISM yet."""
+
+
 # ─── Field-format helpers ─────────────────────────────────────────────────────
 
 # Branch-name keyword → short code stored in the Google Sheet.
@@ -283,6 +287,33 @@ class PrismPage:
         try:
             result = self.page.evaluate("""
                 () => {
+                    // 1) PRISM-specific lx_messagebox (used for 'no record found',
+                    //    system messages, etc.). This dialog is NOT an Ext JS layer
+                    //    and was being missed by the previous selectors, so it
+                    //    lingered and intercepted later clicks.
+                    const lxBox = document.getElementById('lx_messagebox');
+                    if (lxBox && lxBox.offsetParent) {
+                        const lxStyle = getComputedStyle(lxBox);
+                        if (lxStyle.display !== 'none' && lxStyle.visibility !== 'hidden') {
+                            const text = lxBox.textContent || '';
+                            const isTimeout = text.toLowerCase().includes('session timeout');
+                            const buttons = lxBox.querySelectorAll(
+                                'a, button, [role="button"], .lx-btn, .x-btn'
+                            );
+                            for (const btn of buttons) {
+                                const t = (btn.textContent || '').trim().toUpperCase();
+                                if (t === 'OK' || t === 'CLOSE' || t === 'YES') {
+                                    btn.click();
+                                    return { clicked: true, isTimeout: isTimeout };
+                                }
+                            }
+                            // No labelled button — try clicking the box itself to dismiss
+                            if (lxBox.click) lxBox.click();
+                            return { clicked: true, isTimeout: isTimeout };
+                        }
+                    }
+
+                    // 2) Ext JS modal/window overlays
                     const layers = document.querySelectorAll(
                         '.x-layer, .x-window, .x-panel'
                     );
@@ -620,13 +651,45 @@ class PrismPage:
         logger.info(f"SEARCH button click: {btn_result}")
         time.sleep(0.5)   # let PRISM's AJAX request start
 
-        # ── Step 5: Wait for SEARCH RESULTS ──────────────────────────────────
-        # innerText only reflects visible text, so this correctly waits for
-        # the results panel to appear (not just exist hidden in the DOM).
-        self.page.wait_for_function(
-            "() => document.body.innerText.includes('SEARCH RESULTS')",
-            timeout=NAV_TIMEOUT_MS,
-        )
+        # ── Step 5: Wait for SEARCH RESULTS — or a 'no record' dialog ────────
+        # When the agent code doesn't exist in PRISM yet, the portal shows an
+        # lx_messagebox dialog ('No record found') instead of rendering the
+        # SEARCH RESULTS panel. We race both outcomes so a missing agent is
+        # surfaced as not_found instead of a 30s timeout (which previously also
+        # left the dialog on screen, blocking the next agent's clicks).
+        outcome_probe_js = """
+            () => {
+                const body = document.body.innerText || '';
+                if (body.includes('SEARCH RESULTS')) return 'results';
+
+                const candidates = document.querySelectorAll(
+                    '#lx_messagebox, .lx-messagebox, .x-message-box, .x-window'
+                );
+                for (const box of candidates) {
+                    if (!box.offsetParent) continue;
+                    const style = getComputedStyle(box);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    const t = (box.innerText || box.textContent || '').toLowerCase();
+                    if (t.includes('no record') ||
+                        t.includes('no result') ||
+                        t.includes('not found') ||
+                        t.includes('no data found') ||
+                        t.includes('no data available')) {
+                        return 'no-record';
+                    }
+                }
+                return false;
+            }
+        """
+        self.page.wait_for_function(outcome_probe_js, timeout=NAV_TIMEOUT_MS)
+        outcome = self.page.evaluate(outcome_probe_js)
+
+        if outcome == 'no-record':
+            logger.info(f"PRISM reports no record for agent {agent_code} — treating as not found.")
+            # Dismiss the messagebox so it doesn't intercept the next agent's clicks.
+            self.dismiss_overlay()
+            raise AgentNotFoundInPrismError(agent_code)
+
         # Extra pause for Ext JS grid to finish rendering rows via AJAX.
         time.sleep(1.5)
 
@@ -1052,7 +1115,17 @@ def run_prism_update(
 
                     # 5b: Navigate and search
                     prism.go_to_agent_information()
-                    prism.search_agent(agent_code)
+                    try:
+                        prism.search_agent(agent_code)
+                    except AgentNotFoundInPrismError:
+                        # PRISM showed a 'no record' dialog — agent doesn't exist yet.
+                        logger.warning(f"Agent {agent_code} not found in Prism (no-record dialog).")
+                        mark_pending_agent_done(spreadsheet_id, sheet_row, "NOT_FOUND")
+                        result["not_found"].append({
+                            "agent_code": agent_code,
+                            "agent_name": agent_name,
+                        })
+                        continue
 
                     if not prism.has_search_result(agent_code):
                         logger.warning(f"Agent {agent_code} not found in Prism.")
@@ -1108,7 +1181,12 @@ def run_prism_update(
                         time.sleep(2)
                         prism.dismiss_overlay()
                         prism.go_to_agent_information()
-                        prism.search_agent(agent_code)
+                        try:
+                            prism.search_agent(agent_code)
+                        except AgentNotFoundInPrismError:
+                            mark_pending_agent_done(spreadsheet_id, sheet_row, "NOT_FOUND")
+                            result["not_found"].append({"agent_code": agent_code, "agent_name": agent_name})
+                            continue
                         if not prism.has_search_result(agent_code):
                             mark_pending_agent_done(spreadsheet_id, sheet_row, "NOT_FOUND")
                             result["not_found"].append({"agent_code": agent_code, "agent_name": agent_name})
