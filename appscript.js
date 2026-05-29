@@ -13,6 +13,7 @@ function processAndFreezeProductionData() {
   updateUnitColumnFromDatabase();
   appendUnknownAgentsToDatabase();
   freezeCurrentMonthValues();
+  sendBranchSummaryEmail();
   Logger.log("All steps completed.");
 }
 
@@ -363,6 +364,486 @@ function freezeCurrentMonthValues() {
   dbSheet.getRange(startRow, napCol, count, 1).setValues(nap);
 
   Logger.log(`Frozen values written for ${count} agents`);
+}
+
+/* =====================================================
+   STEP 3b: Compute and freeze <Month> REC per agent.
+   Replicates the sheet formula:
+     =IFERROR(COUNTIFS(E:E, G:G, J:J,">="&monthStart, J:J,"<="&monthEnd), 0)
+   For each agent (col G = AGENT CODE), counts how many
+   other agents list them as recruiter (col E = RECRUITER
+   CODE) AND have a DATE APPOINTED (col J) within the
+   current report month. Writes results to "<Month> REC".
+   No more LOV sheet or hand-maintained formulas needed.
+===================================================== */
+function freezeMonthlyRecCount() {
+  Logger.log("Starting freezeMonthlyRecCount");
+
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const dbSheet  = ss.getSheetByName("Database 2026");
+  const rawSheet = ss.getSheetByName("CLEANED_RAW");
+
+  if (!dbSheet || !rawSheet) {
+    Logger.log("freezeMonthlyRecCount: required sheets missing — skipping.");
+    return;
+  }
+
+  // ── Detect month (same source as freezeCurrentMonthValues) ─────────────────
+  const rawDate = rawSheet.getRange("O1").getValue();
+  if (!(rawDate instanceof Date)) {
+    Logger.log("freezeMonthlyRecCount: CLEANED_RAW!O1 is not a date — skipping.");
+    return;
+  }
+  const tz         = ss.getSpreadsheetTimeZone();
+  const month      = Utilities.formatDate(rawDate, tz, "MMM").toUpperCase();
+  const year       = parseInt(Utilities.formatDate(rawDate, tz, "yyyy"));
+  const monthIndex = parseInt(Utilities.formatDate(rawDate, tz, "M")) - 1; // 0-based (0=Jan)
+
+  // Month window as YYYYMMDD strings in the spreadsheet timezone.
+  // String comparison (e.g. "20260501" <= "20260531") is safe and timezone-correct.
+  // Using Utilities.formatDate avoids the UTC-vs-Manila drift that causes
+  // Date object comparisons to silently drop the 1st/last day of the month.
+  const monthStartStr = year + String(monthIndex + 1).padStart(2, "0") + "01";
+  const lastDay       = new Date(year, monthIndex + 1, 0).getDate();
+  const monthEndStr   = year + String(monthIndex + 1).padStart(2, "0") + String(lastDay).padStart(2, "0");
+  Logger.log("freezeMonthlyRecCount: month window " + monthStartStr + " – " + monthEndStr);
+
+  // ── Locate required columns by header name (resilient to reordering) ────────
+  const data    = dbSheet.getDataRange().getValues();
+  const headers = data[0];
+
+  // Mirrors COUNTIFS(E:E, G:G, J:J, ">=start", J:J, "<=end"):
+  //   col E = RECRUITER CODE  (unique — avoids duplicate-name inflation)
+  //   col G = AGENT CODE
+  //   col J = DATE APPOINTED
+  const agentCodeCol     = headers.indexOf("AGENT CODE");      // col G
+  const recruiterCodeCol = headers.indexOf("RECRUITER CODE");  // col E
+  const aptDateCol       = headers.indexOf("DATE APPOINTED");  // col J
+  const recCol           = headers.indexOf(month + " REC");    // e.g. "MAY REC"
+
+  if (agentCodeCol === -1 || recruiterCodeCol === -1 || aptDateCol === -1) {
+    Logger.log("freezeMonthlyRecCount: missing column(s) — " +
+      "AGENT CODE=" + agentCodeCol + ", RECRUITER CODE=" + recruiterCodeCol +
+      ", DATE APPOINTED=" + aptDateCol + " — skipping.");
+    return;
+  }
+  if (recCol === -1) {
+    Logger.log('freezeMonthlyRecCount: "' + month + ' REC" column not found — skipping.');
+    return;
+  }
+
+  // ── Helper: convert a date value to YYYYMMDD string in spreadsheet timezone ─
+  // Appointments stored in Sheets are Asia/Manila time. Date objects are UTC,
+  // so new Date(year, month, 1) for May 1 Manila would be April 30 UTC, silently
+  // dropping appointments on boundary days. String comparison is safe and exact.
+  const toDateStr = function(v) {
+    var d = (v instanceof Date && !isNaN(v.getTime())) ? v
+          : (typeof v === "string" && v.trim() ? new Date(v) : null);
+    if (!d || isNaN(d.getTime())) return null;
+    return Utilities.formatDate(d, tz, "yyyyMMdd");
+  };
+
+  // ── Pass 1: for every agent appointed this month, tally their recruiter ────
+  // Mirrors COUNTIFS(E:E, G:G, ...): for each row whose DATE APPOINTED falls
+  // in the month window, increment the count keyed by that row's RECRUITER CODE.
+  // Using codes (not names) ensures each recruiter is counted exactly once —
+  // name-based matching inflates totals when multiple agents share the same name.
+  const recCounts = {}; // recruiterCode → count
+  for (var i = 1; i < data.length; i++) {
+    var recruiterCode = String(data[i][recruiterCodeCol]).trim();
+    if (!recruiterCode) continue;
+
+    var apptStr = toDateStr(data[i][aptDateCol]);
+    if (!apptStr) continue;
+
+    if (apptStr >= monthStartStr && apptStr <= monthEndStr) {
+      recCounts[recruiterCode] = (recCounts[recruiterCode] || 0) + 1;
+    }
+  }
+
+  // ── Pass 2: write each agent's recruit count by their own agent code ─────────
+  var recValues = [];
+  for (var j = 1; j < data.length; j++) {
+    var agentCode = String(data[j][agentCodeCol]).trim();
+    recValues.push([recCounts[agentCode] || 0]);
+  }
+
+  var count = data.length - 1;
+  dbSheet.getRange(2, recCol + 1, count, 1).setValues(recValues);
+  SpreadsheetApp.flush(); // commit before sendBranchSummaryEmail reads the sheet
+
+  var recruiterSample = Object.keys(recCounts).slice(0, 5).map(function(k) {
+    return k + "=" + recCounts[k];
+  }).join(", ");
+  Logger.log("freezeMonthlyRecCount: wrote " + month + " REC for " + count +
+    " agents. " + Object.keys(recCounts).length + " recruiter(s) had new recruits this month." +
+    (recruiterSample ? " Sample: " + recruiterSample : " — check RECRUITER NAME vs AGENT NAME first-word match."));
+}
+
+/* =====================================================
+   STEP 4: Email the branch production summary
+   Ranked by MTD APE. Computed from Database 2026 using
+   the current report month detected from CLEANED_RAW!O1.
+   Metrics per branch:
+     - MTD APE        = sum of "<MONTH> APE"
+     - YTD APE        = sum of "YTD IDSS"
+     - Recruits       = sum of "<MONTH> REC"
+     - Manpower       = total agents in branch
+     - Active         = agents with "<MONTH> APE" > 0
+     - Activity Ratio = Active / Manpower (%)
+===================================================== */
+function sendBranchSummaryEmail() {
+  Logger.log("Starting sendBranchSummaryEmail");
+
+  // First recipient is for testing. Add more to the array as needed.
+  const RECIPIENTS = [
+    "jlouisencinas@gmail.com",
+    //  "plukfloroespiritu@gmail.com", "plukruthgutierrez@gmail.com",
+  ];
+
+  const NON_BRANCH = new Set(["", "FOR_DB_UPDATE", "UNKNOWN"]);
+
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const dbSheet  = ss.getSheetByName("Database 2026");
+  const rawSheet = ss.getSheetByName("CLEANED_RAW");
+
+  if (!dbSheet || !rawSheet) {
+    Logger.log("sendBranchSummaryEmail: required sheets missing — skipping.");
+    return;
+  }
+
+  // ── Detect month + date (same source the freeze step uses) ──────────────────
+  const rawDate = rawSheet.getRange("O1").getValue();
+  if (!(rawDate instanceof Date)) {
+    Logger.log("sendBranchSummaryEmail: CLEANED_RAW!O1 is not a date — skipping.");
+    return;
+  }
+  const tz             = ss.getSpreadsheetTimeZone();
+  const month          = Utilities.formatDate(rawDate, tz, "MMM").toUpperCase();
+  const reportDateLabel = Utilities.formatDate(rawDate, tz, "MMMM d, yyyy");
+  const generatedAt    = Utilities.formatDate(new Date(), tz, "MMM d, yyyy 'at' h:mm a z");
+
+  // ── Locate columns by header (resilient to reordering) ─────────────────────
+  const data    = dbSheet.getDataRange().getValues();
+  const headers = data[0];
+  const idx     = (name) => headers.indexOf(name);
+
+  const branchCol = idx("BRANCH");
+  const apeCol    = idx(month + " APE");
+  const recCol    = idx(month + " REC");
+  const ytdCol    = idx("YTD IDSS");
+
+  if (branchCol === -1 || apeCol === -1 || ytdCol === -1) {
+    Logger.log("sendBranchSummaryEmail: missing required column(s) — skipping.");
+    return;
+  }
+  if (recCol === -1) Logger.log('"' + month + ' REC" column not found — recruits will show 0.');
+
+  const num = (v) => { const n = parseFloat(String(v).replace(/,/g, "")); return isNaN(n) ? 0 : n; };
+
+  // ── Aggregate per branch ────────────────────────────────────────────────────
+  const stats = {};
+  for (let i = 1; i < data.length; i++) {
+    const branch = String(data[i][branchCol]).trim();
+    if (NON_BRANCH.has(branch)) continue;
+    if (!stats[branch]) stats[branch] = { mtdApe: 0, ytdApe: 0, recruits: 0, manpower: 0, active: 0 };
+    const s   = stats[branch];
+    const ape = num(data[i][apeCol]);
+    s.manpower++;
+    s.mtdApe   += ape;
+    s.ytdApe   += num(data[i][ytdCol]);
+    s.recruits += recCol !== -1 ? num(data[i][recCol]) : 0;
+    if (ape > 0) s.active++;
+  }
+
+  const branches = Object.keys(stats).sort((a, b) => stats[b].mtdApe - stats[a].mtdApe);
+  if (branches.length === 0) { Logger.log("No branch rows found — skipping email."); return; }
+
+  // ── Totals ──────────────────────────────────────────────────────────────────
+  const totals = { mtdApe: 0, ytdApe: 0, recruits: 0, manpower: 0, active: 0 };
+  branches.forEach(function(b) {
+    const s = stats[b];
+    totals.mtdApe   += s.mtdApe;
+    totals.ytdApe   += s.ytdApe;
+    totals.recruits += s.recruits;
+    totals.manpower += s.manpower;
+    totals.active   += s.active;
+  });
+
+  // ── Formatters ──────────────────────────────────────────────────────────────
+  const reportYear  = Utilities.formatDate(rawDate, tz, "yyyy");
+
+  const peso = function(n) {
+    return Math.round(n).toLocaleString("en-PH");
+  };
+  const pct = function(active, manpower) {
+    return manpower > 0 ? ((active / manpower) * 100).toFixed(1) + "%" : "&mdash;";
+  };
+  const ratioColor = function(r) {
+    return r >= 50 ? "#16a34a" : r >= 30 ? "#d97706" : "#dc2626";
+  };
+  // Activity % shown as a colored dot + number (no fill pill — cleaner/professional)
+  const ratioBadge = function(active, manpower) {
+    if (manpower === 0) return '<span style="color:#9ca3af;">&mdash;</span>';
+    const r   = (active / manpower) * 100;
+    const col = ratioColor(r);
+    return '<table cellpadding="0" cellspacing="0" style="margin:0 auto;"><tr>' +
+      '<td style="padding-right:5px;vertical-align:middle;">' +
+        '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:' + col + ';"></span>' +
+      '</td>' +
+      '<td style="vertical-align:middle;">' +
+        '<span style="font-size:13px;font-weight:700;color:' + col + ';">' + r.toFixed(1) + '%</span>' +
+      '</td>' +
+    '</tr></table>';
+  };
+  // Rank badge: gold / silver / bronze / outlined grey
+  const rankBadge = function(i) {
+    if (i === 0) return '<span style="display:inline-block;width:28px;height:28px;border-radius:50%;background:#F59E0B;color:#fff;font-size:12px;font-weight:800;text-align:center;line-height:28px;">1</span>';
+    if (i === 1) return '<span style="display:inline-block;width:28px;height:28px;border-radius:50%;background:#94A3B8;color:#fff;font-size:12px;font-weight:800;text-align:center;line-height:28px;">2</span>';
+    if (i === 2) return '<span style="display:inline-block;width:28px;height:28px;border-radius:50%;background:#B45309;color:#fff;font-size:12px;font-weight:800;text-align:center;line-height:28px;">3</span>';
+    return '<span style="display:inline-block;width:28px;height:28px;border-radius:50%;border:2px solid #CBD5E1;color:#64748B;font-size:12px;font-weight:700;text-align:center;line-height:24px;">' + (i + 1) + '</span>';
+  };
+
+  // ── KPI Cards ───────────────────────────────────────────────────────────────
+  // 2×2 table — no CSS transforms needed, works in all email clients on mobile
+  const kpiCard = function(label, valueHtml, accentColor) {
+    return '<td width="50%" style="padding:4px;">' +
+      '<div style="background:#ffffff;border-top:3px solid ' + accentColor + ';border-radius:6px;' +
+      'padding:12px 14px;border:1px solid #e2e8f0;border-top-width:3px;">' +
+        '<div style="font-size:9px;font-weight:700;letter-spacing:0.8px;color:#94A3B8;' +
+        'text-transform:uppercase;margin-bottom:8px;white-space:nowrap;">' + label + '</div>' +
+        '<div style="font-size:18px;font-weight:800;color:#0f172a;line-height:1;">' + valueHtml + '</div>' +
+      '</div></td>';
+  };
+
+  const overallR     = totals.manpower > 0 ? (totals.active / totals.manpower) * 100 : 0;
+  const ratioDisplay = '<span style="color:' + ratioColor(overallR) + ';">' + pct(totals.active, totals.manpower) + '</span>';
+
+  const kpiRow =
+    '<table width="100%" cellpadding="0" cellspacing="0">' +
+    '<tr>' +
+      kpiCard("Total MTD APE",     peso(totals.mtdApe),                 "#1B3A8C") +
+      kpiCard("Total YTD APE",     peso(totals.ytdApe),                 "#2563EB") +
+    '</tr>' +
+    '<tr>' +
+      kpiCard(month + " Recruits", String(Math.round(totals.recruits)), "#059669") +
+      kpiCard("Activity Ratio",    ratioDisplay,                        "#7C3AED") +
+    '</tr>' +
+    '</table>';
+
+  // ── Branch rows ─────────────────────────────────────────────────────────────
+  const maxMtdApe = stats[branches[0]].mtdApe || 1;
+  const BAR_PX    = 130;
+  let rows = "";
+
+  branches.forEach(function(b, i) {
+    const s     = stats[b];
+    const barW  = Math.round((s.mtdApe / maxMtdApe) * BAR_PX);
+    const rowBg = i % 2 === 0 ? "#ffffff" : "#f8fafc";
+
+    const barHtml = barW > 0
+      ? '<td width="' + barW + '" height="5" bgcolor="#1B3A8C" style="font-size:0;border-radius:3px 0 0 3px;"> </td>' +
+        '<td width="' + (BAR_PX - barW) + '" height="5" bgcolor="#e2e8f0" style="font-size:0;border-radius:0 3px 3px 0;"> </td>'
+      : '<td width="' + BAR_PX + '" height="5" bgcolor="#e2e8f0" style="font-size:0;border-radius:3px;"> </td>';
+
+    rows +=
+      '<tr style="background:' + rowBg + ';">' +
+      // Rank
+      '<td style="padding:12px 10px;border-bottom:1px solid #f1f5f9;text-align:center;white-space:nowrap;">' +
+        rankBadge(i) +
+      '</td>' +
+      // Branch name
+      '<td style="padding:12px 10px;border-bottom:1px solid #f1f5f9;">' +
+        '<span style="font-size:14px;font-weight:700;color:#0f172a;">' + b + '</span>' +
+      '</td>' +
+      // MTD APE + inline bar
+      '<td style="padding:12px 10px;border-bottom:1px solid #f1f5f9;width:170px;">' +
+        '<div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:7px;">' + peso(s.mtdApe) + '</div>' +
+        '<table cellpadding="0" cellspacing="0"><tr>' + barHtml + '</tr></table>' +
+      '</td>' +
+      // YTD APE
+      '<td style="padding:12px 10px;border-bottom:1px solid #f1f5f9;text-align:right;font-size:13px;font-weight:500;color:#475569;white-space:nowrap;">' +
+        peso(s.ytdApe) +
+      '</td>' +
+      // Recruits — clean bold number, no pill
+      '<td style="padding:12px 10px;border-bottom:1px solid #f1f5f9;text-align:center;font-size:14px;font-weight:800;color:#1d4ed8;">' +
+        Math.round(s.recruits) +
+      '</td>' +
+      // Manpower
+      '<td style="padding:12px 10px;border-bottom:1px solid #f1f5f9;text-align:center;">' +
+        '<span style="font-size:14px;font-weight:600;color:#0f172a;">' + s.manpower + '</span>' +
+      '</td>' +
+      // Active
+      '<td style="padding:12px 10px;border-bottom:1px solid #f1f5f9;text-align:center;">' +
+        '<span style="font-size:14px;font-weight:700;color:#0f172a;">' + s.active + '</span>' +
+      '</td>' +
+      // Activity %
+      '<td style="padding:12px 10px;border-bottom:1px solid #f1f5f9;text-align:center;">' +
+        ratioBadge(s.active, s.manpower) +
+      '</td>' +
+      '</tr>';
+  });
+
+  // Totals row
+  const totalRow =
+    '<tr style="background:#fafbfc;">' +
+    '<td style="padding:12px 10px;border-top:2px solid #1B3A8C;"></td>' +
+    '<td style="padding:12px 10px;border-top:2px solid #1B3A8C;">' +
+      '<span style="font-size:12px;font-weight:800;color:#475569;text-transform:uppercase;letter-spacing:0.8px;">All Branches</span>' +
+    '</td>' +
+    '<td style="padding:12px 10px;border-top:2px solid #1B3A8C;">' +
+      '<div style="font-size:14px;font-weight:800;color:#1B3A8C;">' + peso(totals.mtdApe) + '</div>' +
+    '</td>' +
+    '<td style="padding:12px 10px;border-top:2px solid #1B3A8C;text-align:right;font-size:13px;font-weight:800;color:#475569;white-space:nowrap;">' +
+      peso(totals.ytdApe) +
+    '</td>' +
+    '<td style="padding:12px 10px;border-top:2px solid #1B3A8C;text-align:center;font-size:14px;font-weight:800;color:#1d4ed8;">' +
+      Math.round(totals.recruits) +
+    '</td>' +
+    '<td style="padding:12px 10px;border-top:2px solid #1B3A8C;text-align:center;">' +
+      '<span style="font-size:14px;font-weight:800;color:#0f172a;">' + totals.manpower + '</span>' +
+    '</td>' +
+    '<td style="padding:12px 10px;border-top:2px solid #1B3A8C;text-align:center;">' +
+      '<span style="font-size:14px;font-weight:800;color:#0f172a;">' + totals.active + '</span>' +
+    '</td>' +
+    '<td style="padding:12px 10px;border-top:2px solid #1B3A8C;text-align:center;">' +
+      ratioBadge(totals.active, totals.manpower) +
+    '</td>' +
+    '</tr>';
+
+  // ── Full HTML ────────────────────────────────────────────────────────────────
+  const html =
+    // Media queries: supported by Gmail iOS/Android app, Apple Mail, Samsung Mail.
+    // .kc  = KPI card cells → 2×2 grid on mobile
+    // .ew  = outer wrapper  → tighter padding on mobile
+    // .hd  = header inner   → less padding on mobile
+    // .rdp = report-date pill column → hidden on mobile (saves header space)
+    // .kw  = KPI band       → tighter padding on mobile
+    // .rp  = rankings panel → tighter padding on mobile
+    // .bt  = branch table   → smaller font/padding on mobile
+    // .ft  = footer         → tighter padding on mobile
+    '<style>' +
+    '@media only screen and (max-width:600px){' +
+    '.ew{padding:14px 6px!important}' +
+    '.hd{padding:18px 14px 14px!important}' +
+    '.rdp{display:none!important}' +
+    '.kw{padding:14px 10px!important}' +
+    '.rp{padding:16px 10px 18px!important}' +
+    '.bt th{padding:8px 4px!important;font-size:9px!important}' +
+    '.bt td{padding:8px 4px!important;font-size:11px!important}' +
+    '.ft{padding:12px 14px!important}' +
+    '.ttl{font-size:19px!important}' +
+    '}' +
+    '</style>' +
+
+    '<div class="ew" style="background:#E9EEF4;padding:28px 16px;font-family:Arial,Helvetica,sans-serif;">' +
+    '<div style="max-width:680px;margin:0 auto;">' +
+
+    // ── Header ──
+    '<div style="background:#1B3A8C;border-radius:10px 10px 0 0;padding:0;">' +
+      '<div style="background:rgba(255,255,255,0.12);height:4px;border-radius:10px 10px 0 0;"></div>' +
+      '<div class="hd" style="padding:26px 32px 24px;">' +
+        '<table width="100%" cellpadding="0" cellspacing="0"><tr>' +
+          '<td style="vertical-align:top;">' +
+            '<div style="font-size:10px;font-weight:700;letter-spacing:2.5px;' +
+            'color:rgba(255,255,255,0.45);text-transform:uppercase;margin-bottom:6px;">Pru Life UK</div>' +
+            '<div class="ttl" style="font-size:24px;font-weight:800;color:#ffffff;line-height:1.15;margin-bottom:6px;">' +
+              'Branch Production Summary' +
+            '</div>' +
+            '<div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.7);margin-bottom:2px;">' +
+              'Lazurite Keystone Life Area' +
+            '</div>' +
+            // Report date shown inline on mobile (pill is hidden)
+            '<div style="font-size:11px;font-weight:600;color:rgba(255,255,255,0.6);margin-top:8px;">' +
+              reportDateLabel +
+            '</div>' +
+          '</td>' +
+          '<td class="rdp" style="vertical-align:middle;text-align:right;padding-left:20px;">' +
+            '<table cellpadding="0" cellspacing="0" style="margin-left:auto;">' +
+              '<tr><td style="background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.2);' +
+              'border-radius:8px;padding:10px 16px;text-align:center;white-space:nowrap;">' +
+                '<div style="font-size:9px;font-weight:700;letter-spacing:1.5px;' +
+                'color:rgba(255,255,255,0.55);text-transform:uppercase;margin-bottom:4px;">Report Date</div>' +
+                '<div style="font-size:13px;font-weight:700;color:#ffffff;">' + reportDateLabel + '</div>' +
+              '</td></tr>' +
+            '</table>' +
+          '</td>' +
+        '</tr></table>' +
+      '</div>' +
+    '</div>' +
+
+    // ── KPI Cards ──
+    '<div class="kw" style="background:#EEF2F7;padding:20px 24px;border-left:1px solid #d1d9e0;border-right:1px solid #d1d9e0;">' +
+      kpiRow +
+    '</div>' +
+
+    // ── Rankings Table ──
+    '<div class="rp" style="background:#ffffff;padding:24px 28px 28px;' +
+    'border-left:1px solid #d1d9e0;border-right:1px solid #d1d9e0;">' +
+
+      '<table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;"><tr>' +
+        '<td style="vertical-align:middle;">' +
+          '<span style="font-size:11px;font-weight:800;letter-spacing:1.5px;' +
+          'color:#64748b;text-transform:uppercase;">Branch Performance Rankings</span>' +
+        '</td>' +
+        '<td style="text-align:right;vertical-align:middle;">' +
+          '<span style="font-size:11px;color:#94a3b8;font-style:italic;">Ranked by MTD APE &nbsp;&mdash;&nbsp; ' + month + ' ' + reportYear + '</span>' +
+        '</td>' +
+      '</tr></table>' +
+
+      // overflow-x lets the table scroll horizontally on narrow screens
+      '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">' +
+      '<table class="bt" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;min-width:540px;">' +
+        '<thead>' +
+          '<tr style="border-bottom:2px solid #e2e8f0;">' +
+            '<th width="44"  style="padding:10px 10px;text-align:center;font-size:10px;font-weight:700;letter-spacing:0.5px;color:#64748b;text-transform:uppercase;white-space:nowrap;">#</th>' +
+            '<th width="110" style="padding:10px 10px;text-align:left;font-size:10px;font-weight:700;letter-spacing:0.5px;color:#64748b;text-transform:uppercase;">Branch</th>' +
+            '<th width="158" style="padding:10px 10px;text-align:left;font-size:10px;font-weight:700;letter-spacing:0.5px;color:#64748b;text-transform:uppercase;">MTD APE</th>' +
+            '<th width="108" style="padding:10px 10px;text-align:right;font-size:10px;font-weight:700;letter-spacing:0.5px;color:#64748b;text-transform:uppercase;white-space:nowrap;">YTD APE</th>' +
+            '<th width="54"  style="padding:10px 10px;text-align:center;font-size:10px;font-weight:700;letter-spacing:0.5px;color:#64748b;text-transform:uppercase;white-space:nowrap;">REC</th>' +
+            '<th width="76"  style="padding:10px 10px;text-align:center;font-size:10px;font-weight:700;letter-spacing:0.5px;color:#64748b;text-transform:uppercase;white-space:nowrap;">Manpower</th>' +
+            '<th width="62"  style="padding:10px 10px;text-align:center;font-size:10px;font-weight:700;letter-spacing:0.5px;color:#64748b;text-transform:uppercase;white-space:nowrap;">Active</th>' +
+            '<th width="68"  style="padding:10px 10px;text-align:center;font-size:10px;font-weight:700;letter-spacing:0.5px;color:#64748b;text-transform:uppercase;white-space:nowrap;">Activity</th>' +
+          '</tr>' +
+        '</thead>' +
+        '<tbody>' + rows + totalRow + '</tbody>' +
+      '</table>' +
+      '</div>' +
+    '</div>' +
+
+    // ── Footer ──
+    '<div class="ft" style="background:#F8FAFC;border:1px solid #d1d9e0;border-top:none;' +
+    'border-radius:0 0 10px 10px;padding:14px 28px;">' +
+      '<table width="100%" cellpadding="0" cellspacing="0"><tr>' +
+        '<td style="font-size:11px;color:#94a3b8;line-height:2;">' +
+          '<strong style="color:#64748b;">Activity Ratio</strong>' +
+          ' = active agents (MTD APE &gt; 0) &divide; total manpower' +
+          ' &nbsp;&nbsp;' +
+          '<span style="color:#16a34a;font-size:9px;">&#9679;</span> &ge;50%&nbsp;&nbsp;' +
+          '<span style="color:#d97706;font-size:9px;">&#9679;</span> 30&ndash;49%&nbsp;&nbsp;' +
+          '<span style="color:#dc2626;font-size:9px;">&#9679;</span> &lt;30%' +
+          '<br>' +
+          'Generated ' + generatedAt + ' &nbsp;&middot;&nbsp; IDSS Data Platform' +
+        '</td>' +
+      '</tr></table>' +
+    '</div>' +
+
+    '</div></div>';
+
+  const subject = "[LKL] Branch Production Summary — " + reportDateLabel;
+
+  MailApp.sendEmail({ to: RECIPIENTS.join(","), subject: subject, htmlBody: html });
+  Logger.log("sendBranchSummaryEmail: sent to " + RECIPIENTS.join(", ") + " (" + branches.length + " branches).");
+}
+
+/* =====================================================
+   TEST: Run this function directly from the Apps Script
+   editor to send a test email without triggering the
+   full pipeline. Requires CLEANED_RAW to have data
+   from the last run (so the date cell O1 is populated).
+===================================================== */
+function testBranchSummaryEmail() {
+  sendBranchSummaryEmail();
 }
 
 /* =====================================================
