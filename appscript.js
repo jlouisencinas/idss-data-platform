@@ -13,6 +13,7 @@ function processAndFreezeProductionData() {
   updateUnitColumnFromDatabase();
   appendUnknownAgentsToDatabase();
   freezeCurrentMonthValues();
+  freezeMonthlyRecCount();
   sendBranchSummaryEmail();
   Logger.log("All steps completed.");
 }
@@ -388,42 +389,44 @@ function freezeMonthlyRecCount() {
     return;
   }
 
-  // ── Detect month (same source as freezeCurrentMonthValues) ─────────────────
+  // ── Derive month + full month window from the IDSS report date ───────────────
+  // CLEANED_RAW!O1 holds the IDSS report date (e.g. May 16, 2026).
+  // Window = 1st → last day of that month, regardless of which day it is.
+  // No LOV sheet dependency — the window is always the complete calendar month.
   const rawDate = rawSheet.getRange("O1").getValue();
   if (!(rawDate instanceof Date)) {
     Logger.log("freezeMonthlyRecCount: CLEANED_RAW!O1 is not a date — skipping.");
     return;
   }
   const tz         = ss.getSpreadsheetTimeZone();
-  const month      = Utilities.formatDate(rawDate, tz, "MMM").toUpperCase();
-  const year       = parseInt(Utilities.formatDate(rawDate, tz, "yyyy"));
-  const monthIndex = parseInt(Utilities.formatDate(rawDate, tz, "M")) - 1; // 0-based (0=Jan)
-
-  // Month window as YYYYMMDD strings in the spreadsheet timezone.
-  // String comparison (e.g. "20260501" <= "20260531") is safe and timezone-correct.
-  // Using Utilities.formatDate avoids the UTC-vs-Manila drift that causes
-  // Date object comparisons to silently drop the 1st/last day of the month.
-  const monthStartStr = year + String(monthIndex + 1).padStart(2, "0") + "01";
-  const lastDay       = new Date(year, monthIndex + 1, 0).getDate();
-  const monthEndStr   = year + String(monthIndex + 1).padStart(2, "0") + String(lastDay).padStart(2, "0");
-  Logger.log("freezeMonthlyRecCount: month window " + monthStartStr + " – " + monthEndStr);
+  const month      = Utilities.formatDate(rawDate, tz, "MMM").toUpperCase();        // "MAY"
+  const year       = parseInt(Utilities.formatDate(rawDate, tz, "yyyy"), 10);       // 2026
+  const monthNum   = parseInt(Utilities.formatDate(rawDate, tz, "M"),    10);       // 5 (1-based)
+  const lastDay    = new Date(year, monthNum, 0).getDate();                         // last day of month
+  const monthStartStr = year + String(monthNum).padStart(2, "0") + "01";           // "20260501"
+  const monthEndStr   = year + String(monthNum).padStart(2, "0") +
+                        String(lastDay).padStart(2, "0");                           // "20260531"
+  Logger.log("freezeMonthlyRecCount: IDSS date " +
+    Utilities.formatDate(rawDate, tz, "MMM d, yyyy") +
+    " → window " + monthStartStr + " – " + monthEndStr);
 
   // ── Locate required columns by header name (resilient to reordering) ────────
   const data    = dbSheet.getDataRange().getValues();
   const headers = data[0];
 
-  // Mirrors COUNTIFS(E:E, G:G, J:J, ">=start", J:J, "<=end"):
-  //   col E = RECRUITER CODE  (unique — avoids duplicate-name inflation)
-  //   col G = AGENT CODE
-  //   col J = DATE APPOINTED
-  const agentCodeCol     = headers.indexOf("AGENT CODE");      // col G
-  const recruiterCodeCol = headers.indexOf("RECRUITER CODE");  // col E
-  const aptDateCol       = headers.indexOf("DATE APPOINTED");  // col J
-  const recCol           = headers.indexOf(month + " REC");    // e.g. "MAY REC"
+  // RECRUITER NAME    — the recruiter's first name stored on each agent's row
+  // FIRST NAME BASIS  — this agent's own first name (dedicated column)
+  // DATE APPOINTED    — used to filter agents appointed within the month window
+  // Matching: RECRUITER NAME value == FIRST NAME BASIS value → same person
+  const recruiterNameCol = headers.indexOf("RECRUITER NAME");   // col F
+  const firstNameCol     = headers.indexOf("FIRST NAME BASIS"); // dedicated column
+  const aptDateCol       = headers.indexOf("DATE APPOINTED");   // col J
+  const recCol           = headers.indexOf(month + " REC");     // e.g. "MAY REC"
 
-  if (agentCodeCol === -1 || recruiterCodeCol === -1 || aptDateCol === -1) {
+  if (recruiterNameCol === -1 || firstNameCol === -1 || aptDateCol === -1) {
     Logger.log("freezeMonthlyRecCount: missing column(s) — " +
-      "AGENT CODE=" + agentCodeCol + ", RECRUITER CODE=" + recruiterCodeCol +
+      "RECRUITER NAME=" + recruiterNameCol +
+      ", FIRST NAME BASIS=" + firstNameCol +
       ", DATE APPOINTED=" + aptDateCol + " — skipping.");
     return;
   }
@@ -433,9 +436,6 @@ function freezeMonthlyRecCount() {
   }
 
   // ── Helper: convert a date value to YYYYMMDD string in spreadsheet timezone ─
-  // Appointments stored in Sheets are Asia/Manila time. Date objects are UTC,
-  // so new Date(year, month, 1) for May 1 Manila would be April 30 UTC, silently
-  // dropping appointments on boundary days. String comparison is safe and exact.
   const toDateStr = function(v) {
     var d = (v instanceof Date && !isNaN(v.getTime())) ? v
           : (typeof v === "string" && v.trim() ? new Date(v) : null);
@@ -443,41 +443,42 @@ function freezeMonthlyRecCount() {
     return Utilities.formatDate(d, tz, "yyyyMMdd");
   };
 
-  // ── Pass 1: for every agent appointed this month, tally their recruiter ────
-  // Mirrors COUNTIFS(E:E, G:G, ...): for each row whose DATE APPOINTED falls
-  // in the month window, increment the count keyed by that row's RECRUITER CODE.
-  // Using codes (not names) ensures each recruiter is counted exactly once —
-  // name-based matching inflates totals when multiple agents share the same name.
-  const recCounts = {}; // recruiterCode → count
+  // ── Pass 1: count recruits per recruiter ─────────────────────────────────────
+  // For every agent whose DATE APPOINTED falls in the month window,
+  // increment the count keyed by their RECRUITER NAME value.
+  const recCounts = {}; // recruiterName (uppercased) → recruit count
   for (var i = 1; i < data.length; i++) {
-    var recruiterCode = String(data[i][recruiterCodeCol]).trim();
-    if (!recruiterCode) continue;
+    var recruiterName = String(data[i][recruiterNameCol]).trim().toUpperCase();
+    if (!recruiterName) continue;
 
     var apptStr = toDateStr(data[i][aptDateCol]);
     if (!apptStr) continue;
 
     if (apptStr >= monthStartStr && apptStr <= monthEndStr) {
-      recCounts[recruiterCode] = (recCounts[recruiterCode] || 0) + 1;
+      recCounts[recruiterName] = (recCounts[recruiterName] || 0) + 1;
     }
   }
 
-  // ── Pass 2: write each agent's recruit count by their own agent code ─────────
+  // ── Pass 2: write count to the matching recruiter row ────────────────────────
+  // Each agent has a FIRST NAME BASIS value. If that value matches a key in
+  // recCounts (i.e. their first name appears as a RECRUITER NAME for agents
+  // appointed this month), write the count to their <Month> REC cell.
   var recValues = [];
   for (var j = 1; j < data.length; j++) {
-    var agentCode = String(data[j][agentCodeCol]).trim();
-    recValues.push([recCounts[agentCode] || 0]);
+    var firstName = String(data[j][firstNameCol]).trim().toUpperCase();
+    recValues.push([recCounts[firstName] || 0]);
   }
 
   var count = data.length - 1;
   dbSheet.getRange(2, recCol + 1, count, 1).setValues(recValues);
   SpreadsheetApp.flush(); // commit before sendBranchSummaryEmail reads the sheet
 
-  var recruiterSample = Object.keys(recCounts).slice(0, 5).map(function(k) {
+  var sample = Object.keys(recCounts).slice(0, 5).map(function(k) {
     return k + "=" + recCounts[k];
   }).join(", ");
   Logger.log("freezeMonthlyRecCount: wrote " + month + " REC for " + count +
-    " agents. " + Object.keys(recCounts).length + " recruiter(s) had new recruits this month." +
-    (recruiterSample ? " Sample: " + recruiterSample : " — check RECRUITER NAME vs AGENT NAME first-word match."));
+    " agents. " + Object.keys(recCounts).length + " recruiter(s) found." +
+    (sample ? " Sample: " + sample : " — check RECRUITER NAME values vs AGENT NAME words."));
 }
 
 /* =====================================================
