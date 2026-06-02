@@ -85,6 +85,40 @@ def read_range(spreadsheet_id: str, range_name: str) -> list:
         return []
 
 
+def read_cell(spreadsheet_id: str, range_name: str, unformatted: bool = False):
+    """
+    Read a single cell value.
+
+    Args:
+        spreadsheet_id: The spreadsheet ID.
+        range_name:     A1 notation for one cell, e.g. "CLEANED_RAW!O1".
+        unformatted:    When True, returns the raw value (e.g. a date serial
+                        number) instead of the display-formatted string.
+
+    Returns:
+        The cell value (str | int | float), or None if empty / on error.
+    """
+    try:
+        service = _get_sheets_service()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+                valueRenderOption="UNFORMATTED_VALUE" if unformatted else "FORMATTED_VALUE",
+            )
+            .execute()
+        )
+        vals = result.get("values", [])
+        if vals and vals[0]:
+            return vals[0][0]
+        return None
+    except HttpError as e:
+        logger.error(f"Sheets read error [{range_name}]: {e}")
+        return None
+
+
 def batch_update(spreadsheet_id: str, updates: list) -> bool:
     """
     Batch-update multiple cell ranges in a single API call.

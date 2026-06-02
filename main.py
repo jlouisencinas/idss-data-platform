@@ -35,6 +35,12 @@ def parse_args():
         action="store_true",
         help="Run ingestion only (download ZIPs from Gmail, skip processing)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Local test: download + extract + transform + save CSV, but skip "
+             "Drive upload, Apps Script trigger (no email/sheet write) and PRISM.",
+    )
     return parser.parse_args()
 
 
@@ -47,7 +53,7 @@ def main():
         logger.info(f"Downloaded: {files or 'no new files'}")
         return
 
-    run_pipeline(use_ai_validation=args.ai)
+    run_pipeline(use_ai_validation=args.ai, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

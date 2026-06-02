@@ -15,11 +15,18 @@ Architecture:
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 
 from connectors.drive_connector import upload_file
+from connectors.gmail_connector import (
+    BRANCH_REGEX,
+    UNIT_REGEX,
+    fetch_latest_messages,
+    get_gmail_service,
+)
+from connectors.sheets_connector import read_cell
 from core import config
 from core.logger import get_logger
 from integrations.apps_script import trigger_apps_script
@@ -34,18 +41,95 @@ from storage.local_storage import cleanup_directory, save_csv
 logger = get_logger(__name__)
 
 
-def run_pipeline(use_ai_validation: bool = False) -> None:
+# ─── Pre-check: is the latest email report already processed? ──────────────────
+
+def _to_yyyymmdd(v) -> str | None:
+    """Normalize a date value (Sheets serial number or string) to 'YYYYMMDD'."""
+    if v is None or v == "":
+        return None
+    # Google Sheets serial date number (days since 1899-12-30)
+    if isinstance(v, (int, float)):
+        return (datetime(1899, 12, 30) + timedelta(days=float(v))).strftime("%Y%m%d")
+    s = str(v).strip()
+    if not s:
+        return None
+    for fmt in ("%Y%m%d", "%B %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+    # Fallback: numeric string serial
+    try:
+        return (datetime(1899, 12, 30) + timedelta(days=float(s))).strftime("%Y%m%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _latest_email_report_date() -> str | None:
+    """Latest report date (YYYYMMDD) across Branch + Unit emails — metadata only."""
+    service = get_gmail_service(
+        credentials_path=config.CREDENTIALS_PATH,
+        token_path=config.TOKEN_PATH,
+        scopes=config.GMAIL_SCOPES,
+    )
+    _, branch_date = fetch_latest_messages(
+        service, BRANCH_REGEX, config.BRANCH_SUBJECT_QUERY, max_messages=config.MAX_MESSAGES
+    )
+    _, unit_date = fetch_latest_messages(
+        service, UNIT_REGEX, config.UNIT_SUBJECT_QUERY, max_messages=config.MAX_MESSAGES
+    )
+    dates = [d for d in (branch_date, unit_date) if d]
+    return max(dates) if dates else None
+
+
+def _sheet_last_report_date() -> str | None:
+    """The last processed report date from CLEANED_RAW!O1 (YYYYMMDD)."""
+    if not config.SPREADSHEET_ID:
+        return None
+    raw = read_cell(config.SPREADSHEET_ID, "CLEANED_RAW!O1", unformatted=True)
+    return _to_yyyymmdd(raw)
+
+
+def run_pipeline(use_ai_validation: bool = False, dry_run: bool = False) -> None:
     """
     Execute the full IDSS data pipeline end-to-end.
 
     Args:
         use_ai_validation: When True, run AI-based record validation
                            before saving (requires ANTHROPIC_API_KEY).
+        dry_run: When True, run download → extract → transform → save CSV
+                 locally, but SKIP the Drive upload, Apps Script trigger
+                 (no email / no sheet write) and PRISM enrichment.
+                 Safe for local testing — no production side effects.
     """
     start = datetime.now()
     logger.info("=" * 60)
     logger.info("IDSS Data Platform — Pipeline START")
     logger.info("=" * 60)
+
+    # ── Step 0: Skip if the latest email report is already in the sheet ──────
+    # Compare the latest report date in Gmail against CLEANED_RAW!O1 (the date
+    # of the last report we processed). If the email's report date is not newer,
+    # the report is already processed — skip the whole run before downloading.
+    # (Bypassed in dry-run so you can re-test extraction on the current report.)
+    if dry_run:
+        logger.info("DRY RUN — bypassing the already-processed date check.")
+    else:
+        try:
+            email_date = _latest_email_report_date()
+            sheet_date = _sheet_last_report_date()
+            logger.info(
+                f"Date check — latest email report: {email_date or 'none'} | "
+                f"sheet CLEANED_RAW!O1: {sheet_date or 'none'}"
+            )
+            if email_date and sheet_date and email_date <= sheet_date:
+                logger.info(
+                    f"Report {email_date} is already processed (sheet date {sheet_date}). "
+                    "Nothing new — skipping pipeline."
+                )
+                return
+        except Exception as e:
+            logger.warning(f"Date pre-check failed ({e}); proceeding with pipeline anyway.")
 
     # ── Step 1: CLOUD — Download from Gmail ──────────────────────────────────
     logger.info("[1/5] Downloading IDSS reports from Gmail...")
@@ -147,6 +231,17 @@ def run_pipeline(use_ai_validation: bool = False) -> None:
         summary = summarize_report_with_ai(summary_meta)
         if summary:
             logger.info(f"AI Report Summary:\n{summary}")
+
+    # ── DRY RUN: stop here — no Drive upload, no Apps Script, no PRISM ─────────
+    if dry_run:
+        logger.info("=" * 60)
+        logger.info("DRY RUN — stopping before any production side effects.")
+        logger.info(f"  Rows extracted : {len(final_df)}")
+        logger.info(f"  Report date    : {report_date_str}")
+        logger.info(f"  CSV written to : {csv_path}")
+        logger.info("  Skipped: Drive upload, Apps Script trigger (email + sheet write), PRISM.")
+        logger.info("=" * 60)
+        return
 
     # ── Step 5: CLOUD — Upload to Drive & Trigger Apps Script ─────────────────
     logger.info("[5/5] Uploading to Google Drive and triggering Apps Script...")
