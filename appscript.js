@@ -11,6 +11,7 @@ function doPost(e) {
 function processAndFreezeProductionData() {
   Logger.log("Starting full process...");
   updateUnitColumnFromDatabase();
+  deleteDelistedAgents();          // remove agents marked "*" (delisted) from Database
   appendUnknownAgentsToDatabase();
   freezeCurrentMonthValues();
   freezeMonthlyRecCount();
@@ -109,6 +110,87 @@ function updateUnitColumnFromDatabase() {
     .setValues(output);
 
   Logger.log(`CLEANED_RAW updated with ${output.length - 1} records`);
+}
+
+/* =====================================================
+   STEP 1b: Delete DELISTED agents from Database 2026.
+   Agents whose name ends with "*" in the report are
+   delisted. We detect them in CLEANED_RAW (col C = AGENT
+   NAME, col B = AGENT CODE) and delete their entire row
+   from Database 2026, matching by AGENT CODE (falling
+   back to AGENT NAME when the code is blank).
+   Rows are deleted bottom-to-top so indices don't shift.
+===================================================== */
+function deleteDelistedAgents() {
+  Logger.log("Checking for delisted (*) agents...");
+
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const rawSheet = ss.getSheetByName("CLEANED_RAW");
+  const dbSheet  = ss.getSheetByName("Database 2026");
+
+  if (!rawSheet || !dbSheet) {
+    Logger.log("deleteDelistedAgents: required sheets missing — skipping.");
+    return;
+  }
+
+  // ── 1. Collect delisted codes + names from CLEANED_RAW ─────────────────────
+  // CLEANED_RAW columns: A=UNIT(0), B=AGENT CODE(1), C=AGENT NAME(2)
+  const rawData = rawSheet.getDataRange().getValues();
+  const stripStar = function (s) {
+    return String(s).trim().replace(/\s*\*+\s*$/, "").trim().toUpperCase();
+  };
+
+  const delistedCodes = {};  // normalized code -> true
+  const delistedNames = {};  // normalized name (no *) -> true
+
+  for (var i = 1; i < rawData.length; i++) {
+    var nameCell = String(rawData[i][2]).trim();
+    if (!nameCell || !/\*\s*$/.test(nameCell)) continue;  // only names ending with *
+    var code = String(rawData[i][1]).trim();
+    if (code) delistedCodes[code] = true;
+    delistedNames[stripStar(nameCell)] = true;
+  }
+
+  var totalFlagged = Object.keys(delistedCodes).length + Object.keys(delistedNames).length;
+  if (Object.keys(delistedNames).length === 0) {
+    Logger.log("deleteDelistedAgents: no delisted (*) agents in this report.");
+    return;
+  }
+  Logger.log("deleteDelistedAgents: delisted codes=" +
+    JSON.stringify(Object.keys(delistedCodes)) +
+    " names=" + JSON.stringify(Object.keys(delistedNames)));
+
+  // ── 2. Find matching rows in Database 2026 ─────────────────────────────────
+  const dbData      = dbSheet.getDataRange().getValues();
+  const dbHeaders   = dbData[0];
+  const agentCodeCol = dbHeaders.indexOf("AGENT CODE");
+  const agentNameCol = dbHeaders.indexOf("AGENT NAME");
+
+  if (agentCodeCol === -1 || agentNameCol === -1) {
+    Logger.log("deleteDelistedAgents: AGENT CODE/NAME column missing — skipping.");
+    return;
+  }
+
+  const rowsToDelete = [];  // 1-indexed sheet rows
+  for (var r = 1; r < dbData.length; r++) {
+    var dbCode = String(dbData[r][agentCodeCol]).trim();
+    var dbName = stripStar(dbData[r][agentNameCol]);
+    if ((dbCode && delistedCodes[dbCode]) || (dbName && delistedNames[dbName])) {
+      rowsToDelete.push(r + 1);  // +1 → 1-indexed sheet row
+    }
+  }
+
+  if (rowsToDelete.length === 0) {
+    Logger.log("deleteDelistedAgents: no matching Database rows (already removed?).");
+    return;
+  }
+
+  // ── 3. Delete bottom-to-top so row indices don't shift ─────────────────────
+  rowsToDelete.sort(function (a, b) { return b - a; });
+  rowsToDelete.forEach(function (rowNum) { dbSheet.deleteRow(rowNum); });
+
+  Logger.log("deleteDelistedAgents: deleted " + rowsToDelete.length +
+    " row(s) from Database 2026 (flagged " + Object.keys(delistedNames).length + " agent(s)).");
 }
 
 /* =====================================================

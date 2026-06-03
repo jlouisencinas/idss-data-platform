@@ -73,8 +73,9 @@ def _parse_agent_row(row: list) -> list | None:
     else:
         return None
 
-    if name.endswith("*"):
-        return None
+    # NOTE: agents whose name ends with "*" are DELISTED. We intentionally keep
+    # them (marker preserved on the name) so the Apps Script can detect and remove
+    # their row from Database 2026. They are no longer dropped here.
 
     numeric = _clean_numbers(row[2:])
     cleaned = [code, name] + numeric
@@ -105,6 +106,16 @@ def build_dataframe(table_rows: list, orphan_rows: list, report_date: str) -> pd
     df = pd.DataFrame(cleaned, columns=["AGENT CODE", "AGENT NAME"] + numeric_cols)
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
 
+    # ── Delisted (*) agents ──────────────────────────────────────────────────
+    # Record which codes are delisted, then strip the "*" so grouping is clean.
+    # The marker is re-applied after grouping so it survives the longest-name
+    # selection (a longer non-"*" name variant would otherwise drop it).
+    name_stripped  = df["AGENT NAME"].str.strip()
+    delisted_codes = set(df.loc[name_stripped.str.endswith("*"), "AGENT CODE"])
+    df["AGENT NAME"] = name_stripped.str.replace(r"\s*\*+\s*$", "", regex=True).str.strip()
+    if delisted_codes:
+        logger.info(f"Delisted (*) agents detected: {sorted(delisted_codes)}")
+
     # Deduplicate exact numeric duplicates (same agent + same values)
     df = df.drop_duplicates(subset=["AGENT CODE"] + numeric_cols)
 
@@ -115,6 +126,11 @@ def build_dataframe(table_rows: list, orphan_rows: list, report_date: str) -> pd
         {"AGENT NAME": "first", **{c: "sum" for c in numeric_cols}}
     )
     df.drop(columns=["_name_len"], errors="ignore", inplace=True)
+
+    # Re-apply the "*" marker to delisted agents (post-grouping, guaranteed)
+    if delisted_codes:
+        mask = df["AGENT CODE"].isin(delisted_codes)
+        df.loc[mask, "AGENT NAME"] = df.loc[mask, "AGENT NAME"].str.rstrip() + "*"
 
     df.insert(0, "UNIT", "UNKNOWN")
     df["REPORT_DATE"] = report_date
@@ -137,12 +153,21 @@ def finalize_consolidated(df: pd.DataFrame) -> pd.DataFrame:
     # Drop UNIT before groupby (string column not in the agg spec)
     df = df.drop(columns=["UNIT"], errors="ignore")
 
+    # Preserve delisted "*" markers across the cross-file grouping too
+    name_stripped  = df["AGENT NAME"].str.strip()
+    delisted_codes = set(df.loc[name_stripped.str.endswith("*"), "AGENT CODE"])
+    df["AGENT NAME"] = name_stripped.str.replace(r"\s*\*+\s*$", "", regex=True).str.strip()
+
     df["_name_len"] = df["AGENT NAME"].str.len()
     df = df.sort_values("_name_len", ascending=False)
     df = df.groupby(["AGENT CODE", "REPORT_DATE"], as_index=False).agg(
         {"AGENT NAME": "first", **{c: "sum" for c in numeric_cols}}
     )
     df.drop(columns=["_name_len"], errors="ignore", inplace=True)
+
+    if delisted_codes:
+        mask = df["AGENT CODE"].isin(delisted_codes)
+        df.loc[mask, "AGENT NAME"] = df.loc[mask, "AGENT NAME"].str.rstrip() + "*"
 
     unique_dates = df["REPORT_DATE"].unique()
     if len(unique_dates) != 1:

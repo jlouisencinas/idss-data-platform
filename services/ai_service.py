@@ -44,7 +44,7 @@ Each object in the array must have these exact keys:
 
 Rules:
 - Skip header rows, summary rows, manager lines (BM:, DM:, UM:, etc.)
-- Skip rows ending with "*"
+- KEEP rows ending with "*" (these mark delisted agents — preserve the "*" on the name)
 - Use 0 for any missing numeric field
 - Return ONLY valid JSON (no markdown, no commentary)
 
