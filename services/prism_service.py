@@ -736,6 +736,44 @@ class PrismPage:
                     f"| sample links: {result['sample']}")
         return bool(result["found"])
 
+    def get_result_status(self, agent_code: str = "") -> str:
+        """
+        Read the agent's STATUS directly from the SEARCH RESULTS grid —
+        no need to open the agent details page (much faster for bulk audits).
+
+        With an 'Agent code' filter the grid shows a single row; we scan its
+        cells for a known status token (ACTIVE / TERMINATED / etc.) and return
+        it uppercased. Returns "" if no recognizable status cell is found.
+        """
+        result = self.page.evaluate(
+            """
+            () => {
+                const norm = s => (s || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim();
+                const STATUSES = [
+                    'TERMINATED','ACTIVE','RESIGNED','CANCELLED','CANCELED',
+                    'LAPSED','SUSPENDED','INACTIVE','PENDING','DECEASED','RETIRED'
+                ];
+                const cellEls = document.querySelectorAll('.x-grid-cell, table td');
+                const cells = [];
+                let status = '';
+                for (const c of cellEls) {
+                    const t = norm(c.textContent);
+                    if (!t) continue;
+                    cells.push(t);
+                    if (!status && STATUSES.includes(t.toUpperCase())) status = t.toUpperCase();
+                }
+                return { status, cells: cells.slice(0, 40) };
+            }
+            """
+        )
+        status = (result.get("status") or "").strip()
+        if not status:
+            logger.warning(
+                f"get_result_status({agent_code}): no status cell found. "
+                f"Grid cells: {result.get('cells', [])[:20]}"
+            )
+        return status
+
     def click_agent_result(self, agent_code: str):
         """
         Click the agent code link in the search results table.
@@ -951,6 +989,85 @@ class PrismPage:
 
         logger.info(f"Extracted details: {result}")
         return result
+
+    def extract_all_fields(self) -> dict:
+        """
+        Return EVERY label→value pair on the agent details page.
+
+        Used by the standalone termination audit: the STATUS field's exact
+        label varies, so we capture everything and let the caller search for
+        the key containing "STATUS".
+        """
+        try:
+            self.page.wait_for_function(
+                """() => {
+                    const inps = document.querySelectorAll('input[type="text"]');
+                    let withVal = 0;
+                    inps.forEach(i => { if (i.value && i.value.trim()) withVal++; });
+                    return withVal >= 3;
+                }""",
+                timeout=10_000,
+            )
+        except PlaywrightTimeoutError:
+            pass
+
+        fields = self.page.evaluate(
+            """
+            () => {
+                const norm = s => (s || '').toString()
+                    .replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim();
+                const out = {};
+
+                // Ext components
+                if (typeof Ext !== 'undefined') {
+                    try {
+                        const fs = Ext.ComponentQuery.query(
+                            'displayfield, textfield, datefield, combobox, field, [fieldLabel]'
+                        );
+                        for (const f of fs) {
+                            const lbl = norm(f.fieldLabel || '');
+                            let val = '';
+                            try { val = f.getRawValue ? f.getRawValue() : (f.getValue ? f.getValue() : ''); } catch(e){}
+                            val = norm(val == null ? '' : String(val));
+                            if (lbl && val && !(lbl in out)) out[lbl] = val;
+                        }
+                    } catch(e) {}
+                }
+
+                // DOM input/label pairing
+                const findLabelFor = (inp) => {
+                    if (inp.id) {
+                        const l = document.querySelector('label[for="' + CSS.escape(inp.id) + '"]');
+                        if (l) { const t = norm(l.textContent); if (t) return t.replace(/:\\s*$/, ''); }
+                    }
+                    let cur = inp;
+                    for (let d = 0; d < 6; d++) {
+                        let sib = cur.previousElementSibling;
+                        while (sib) {
+                            const t = norm(sib.textContent);
+                            if (t && t.length < 80 && /:\\s*$/.test(t)) return t.replace(/:\\s*$/, '');
+                            if (t && t.length < 80 && /^[A-Z][A-Z\\s/]+:?$/.test(t)) return t.replace(/:\\s*$/, '');
+                            sib = sib.previousElementSibling;
+                        }
+                        if (!cur.parentElement) break;
+                        cur = cur.parentElement;
+                    }
+                    return '';
+                };
+                const inputs = document.querySelectorAll(
+                    'input[type="text"], input:not([type]), textarea, select'
+                );
+                inputs.forEach(inp => {
+                    const val = norm(inp.value);
+                    if (!val) return;
+                    const lbl = findLabelFor(inp);
+                    if (lbl && !(lbl in out)) out[lbl] = val;
+                });
+                return out;
+            }
+            """
+        )
+        return fields or {}
 
 
 # ─── Login orchestration ──────────────────────────────────────────────────────

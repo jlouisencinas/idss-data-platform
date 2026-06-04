@@ -151,6 +151,123 @@ def batch_update(spreadsheet_id: str, updates: list) -> bool:
         return False
 
 
+def append_rows(spreadsheet_id: str, range_name: str, rows: list) -> bool:
+    """
+    Append rows to the bottom of a sheet (values().append).
+
+    Args:
+        spreadsheet_id: The spreadsheet ID.
+        range_name:     A1 notation, e.g. "TERMINATED_AUDIT!A:E".
+        rows:           List of row lists to append.
+
+    Returns:
+        True on success, False on error.
+    """
+    if not rows:
+        return True
+    try:
+        service = _get_sheets_service()
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()
+        return True
+    except HttpError as e:
+        logger.error(f"Sheets append error [{range_name}]: {e}")
+        return False
+
+
+def ensure_sheet(spreadsheet_id: str, title: str, headers: list = None) -> None:
+    """
+    Create a sheet/tab if it doesn't exist, optionally writing a header row.
+    No-op if the sheet already exists.
+    """
+    try:
+        service = _get_sheets_service()
+        meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        existing = [s["properties"]["title"] for s in meta.get("sheets", [])]
+        if title in existing:
+            return
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+        ).execute()
+        if headers:
+            service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{title}!A1",
+                valueInputOption="USER_ENTERED",
+                body={"values": [headers]},
+            ).execute()
+        logger.info(f"Created sheet '{title}'.")
+    except HttpError as e:
+        logger.error(f"Sheets ensure_sheet error [{title}]: {e}")
+
+
+def get_sheet_id(spreadsheet_id: str, title: str):
+    """Return the numeric sheetId (gid) for a tab title, or None if not found."""
+    try:
+        service = _get_sheets_service()
+        meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        for s in meta.get("sheets", []):
+            if s["properties"]["title"] == title:
+                return s["properties"]["sheetId"]
+    except HttpError as e:
+        logger.error(f"get_sheet_id error [{title}]: {e}")
+    return None
+
+
+def delete_rows(spreadsheet_id: str, sheet_title: str, row_numbers_1indexed: list) -> bool:
+    """
+    Delete entire rows from a sheet by their 1-indexed row numbers.
+
+    Rows are deleted bottom-to-top so indices don't shift mid-operation.
+
+    Args:
+        spreadsheet_id:       The spreadsheet ID.
+        sheet_title:          Tab name, e.g. "Database 2026".
+        row_numbers_1indexed: List of 1-indexed sheet row numbers to delete.
+
+    Returns:
+        True on success, False on error.
+    """
+    if not row_numbers_1indexed:
+        return True
+
+    sheet_id = get_sheet_id(spreadsheet_id, sheet_title)
+    if sheet_id is None:
+        logger.error(f"delete_rows: sheet '{sheet_title}' not found.")
+        return False
+
+    requests = []
+    for rn in sorted(set(row_numbers_1indexed), reverse=True):
+        start = rn - 1  # API is 0-indexed, end exclusive
+        requests.append({
+            "deleteDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": start,
+                    "endIndex": start + 1,
+                }
+            }
+        })
+
+    try:
+        service = _get_sheets_service()
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id, body={"requests": requests}
+        ).execute()
+        logger.info(f"Deleted {len(requests)} row(s) from '{sheet_title}'.")
+        return True
+    except HttpError as e:
+        logger.error(f"delete_rows error [{sheet_title}]: {e}")
+        return False
+
+
 # ─── Domain helpers ───────────────────────────────────────────────────────────
 
 def get_pending_agents(spreadsheet_id: str) -> list[dict]:
