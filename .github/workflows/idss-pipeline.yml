@@ -1,8 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # .github/workflows/idss-pipeline.yml
 #
-# Runs the IDSS Data Platform pipeline on a daily schedule.
-# Triggers: daily at 8 AM Manila time (UTC+8 = 00:00 UTC)
+# Runs the IDSS Data Platform pipeline on a recurring schedule.
+# Triggers: 4x daily, every 6 hours — 8 AM, 2 PM, 8 PM, 2 AM Manila time
+#           (UTC+8; cron at 00:00, 06:00, 12:00, 18:00 UTC)
 #           manual dispatch (Actions tab → Run workflow)
 #
 # Required GitHub Secrets (Settings → Secrets → Actions):
@@ -22,7 +23,7 @@ name: IDSS Pipeline
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 8 AM Manila time (UTC+8)
+    - cron: "0 0,6,12,18 * * *"   # every 6h → 8 AM / 2 PM / 8 PM / 2 AM Manila (UTC+8)
   workflow_dispatch:        # allow manual runs from the Actions tab
 
 jobs:
