@@ -2,9 +2,17 @@
 # .github/workflows/idss-pipeline.yml
 #
 # Runs the IDSS Data Platform pipeline on a recurring schedule.
-# Triggers: 4x daily, every 6 hours — 8 AM, 2 PM, 8 PM, 2 AM Manila time
-#           (UTC+8; cron at 00:00, 06:00, 12:00, 18:00 UTC)
+#
+# Triggers: 8x daily, every 3 hours — 8 AM, 11 AM, 2 PM, 5 PM,
+#           8 PM, 11 PM, 2 AM, 5 AM Manila time
+#           (UTC+8; cron at 00:00, 03:00, 06:00, 09:00,
+#                         12:00, 15:00, 18:00, 21:00 UTC)
 #           manual dispatch (Actions tab → Run workflow)
+#
+# Smart scheduling: the check-emails job first verifies that all 4 branch
+# report emails have arrived for a report date. If they have not, the job
+# exits cleanly and the pipeline is skipped until the next scheduled run.
+# Manual dispatch always bypasses this check and runs the full pipeline.
 #
 # Required GitHub Secrets (Settings → Secrets → Actions):
 #   GMAIL_TOKEN_JSON      — OAuth2 token for jlouisencinas Gmail (report downloads)
@@ -23,12 +31,47 @@ name: IDSS Pipeline
 
 on:
   schedule:
-    - cron: "0 0,6,12,18 * * *"   # every 6h → 8 AM / 2 PM / 8 PM / 2 AM Manila (UTC+8)
-  workflow_dispatch:        # allow manual runs from the Actions tab
+    - cron: "0 */3 * * *"   # every 3h → 8 AM / 11 AM / 2 PM / 5 PM / 8 PM / 11 PM / 2 AM / 5 AM Manila (UTC+8)
+  workflow_dispatch:         # manual run — bypasses email check
 
 jobs:
+
+  # ── 1. Pre-flight: check that all 4 branch report emails have arrived ────────
+  check-emails:
+    name: Check branch report emails
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Gmail client libraries
+        run: pip install google-api-python-client google-auth google-auth-oauthlib
+
+      - name: Check for complete branch report set
+        id: check
+        env:
+          PRISM_OTP_TOKEN_JSON: ${{ secrets.PRISM_OTP_TOKEN_JSON }}
+          GITHUB_EVENT_NAME:    ${{ github.event_name }}
+        run: |
+          result=$(python scripts/check_branch_emails.py)
+          echo "should_run=$result" >> $GITHUB_OUTPUT
+          echo "Result: $result"
+
+  # ── 2. Full pipeline — only runs when check-emails passes ───────────────────
   run-pipeline:
     name: Run IDSS Pipeline
+    needs: check-emails
+    if: needs.check-emails.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
