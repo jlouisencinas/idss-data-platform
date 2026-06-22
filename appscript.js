@@ -191,6 +191,24 @@ function deleteDelistedAgents() {
 
   Logger.log("deleteDelistedAgents: deleted " + rowsToDelete.length +
     " row(s) from Database 2026 (flagged " + Object.keys(delistedNames).length + " agent(s)).");
+
+  // ── 4. Also purge delisted agents from PENDING_PRISM_UPDATE ────────────────
+  // They may have been queued by a prior run before they were delisted.
+  const pendingSheet = ss.getSheetByName("PENDING_PRISM_UPDATE");
+  if (pendingSheet) {
+    const pendingData = pendingSheet.getDataRange().getValues();
+    const pendingRowsToDrop = [];
+    for (var p = 1; p < pendingData.length; p++) {
+      var pCode = String(pendingData[p][0]).trim();
+      if (pCode && delistedCodes[pCode]) pendingRowsToDrop.push(p + 1);
+    }
+    if (pendingRowsToDrop.length > 0) {
+      pendingRowsToDrop.sort(function (a, b) { return b - a; });
+      pendingRowsToDrop.forEach(function (r) { pendingSheet.deleteRow(r); });
+      Logger.log("deleteDelistedAgents: removed " + pendingRowsToDrop.length +
+        " delisted agent(s) from PENDING_PRISM_UPDATE.");
+    }
+  }
 }
 
 /* =====================================================
@@ -225,12 +243,13 @@ function appendUnknownAgentsToDatabase() {
   const rowsToInsert = [];
   const rowsToMark = [];
 
-  // --- STEP 1: Scan bottom-to-top for the UNKNOWN block ---
-  // The last row(s) may NOT be UNKNOWN (e.g. a totals row), so we cannot bail
-  // out early. Instead we use a state machine:
-  //   - While passedUnknown is false : skip non-UNKNOWN trailing rows (continue)
-  //   - Once we hit an UNKNOWN row    : start collecting (passedUnknown = true)
-  //   - Next non-UNKNOWN above block  : break (we have exited the UNKNOWN block)
+  // --- STEP 1: Scan bottom-to-top for UNKNOWN agents ---
+  // Rules:
+  //   - "UNKNOWN"        → new agent: collect if not already in DB
+  //   - "FOR_DB_UPDATE"  → already queued from a prior run: transparent, never
+  //                        a block boundary (always continue, never break)
+  //   - anything else    → regular branch row: skip while below UNKNOWN block;
+  //                        once we have passed UNKNOWN rows, stop (break)
   const lastRowIndex = rawData.length - 1;
   let passedUnknown = false;
 
@@ -240,13 +259,19 @@ function appendUnknownAgentsToDatabase() {
     const code = String(row[1]).trim();
     const name = String(row[2]).trim();
 
-    if (unit !== "UNKNOWN") {
-      if (passedUnknown) break;   // exited the UNKNOWN block going upward
-      continue;                   // still in trailing non-UNKNOWN rows — keep scanning
+    if (unit === "FOR_DB_UPDATE") {
+      continue;   // already-queued agent — scan past it, never treat as a boundary
     }
 
+    if (unit !== "UNKNOWN") {
+      if (passedUnknown) break;   // exited the UNKNOWN block going upward
+      continue;                   // still in trailing regular rows — keep scanning
+    }
+
+    // unit === "UNKNOWN"
     passedUnknown = true;
-    if (code && !existingCodes.has(code)) {
+    if (code && !existingCodes.has(code) && !/\*\s*$/.test(name)) {
+      // skip delisted agents (name ends with *) even on first appearance
       const newRow = new Array(dbHeaders.length).fill("");
       newRow[agentCodeCol] = code;
       newRow[agentNameCol] = name;
@@ -259,8 +284,8 @@ function appendUnknownAgentsToDatabase() {
   }
 
   Logger.log(passedUnknown
-    ? `Scanned bottom-to-top: found UNKNOWN block, ${rowsToInsert.length} new agent(s).`
-    : "Scanned bottom-to-top: no UNKNOWN rows found in this report."
+    ? `Scanned bottom-to-top: found UNKNOWN agent(s), ${rowsToInsert.length} new to insert.`
+    : "Scanned bottom-to-top: no UNKNOWN rows found — checking for pending FOR_DB_UPDATE agents."
   );
 
   // --- STEP 3: Insert into Database ---
@@ -330,10 +355,19 @@ function appendUnknownAgentsToDatabase() {
       // PRISM automation is still running — leave the sheet alone
       Logger.log("PENDING_PRISM_UPDATE has unprocessed agents — skipping clear.");
     } else {
-      // No active pending rows — check Database for agents still tagged FOR_DB_UPDATE
-      const forUpdateAgents = dbData.slice(1).filter(
-        r => String(r[unitColInDB]).trim() === "FOR_DB_UPDATE"
+      // No active pending rows — check Database for agents still tagged FOR_DB_UPDATE.
+      // Exclude any agent whose name in CLEANED_RAW ends with * (delisted).
+      const delistedInRaw = new Set(
+        rawData.slice(1)
+          .filter(r => /\*\s*$/.test(String(r[2]).trim()))
+          .map(r => String(r[1]).trim())
+          .filter(Boolean)
       );
+      const forUpdateAgents = dbData.slice(1).filter(r => {
+        const branch = String(r[unitColInDB]).trim();
+        const code   = String(r[agentCodeCol]).trim();
+        return branch === "FOR_DB_UPDATE" && !delistedInRaw.has(code);
+      });
 
       if (forUpdateAgents.length > 0) {
         // Rebuild PENDING_PRISM_UPDATE so PRISM automation can pick them up
