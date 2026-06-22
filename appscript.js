@@ -225,24 +225,27 @@ function appendUnknownAgentsToDatabase() {
   const rowsToInsert = [];
   const rowsToMark = [];
 
-  // --- STEP 1: Validate bottom row ---
+  // --- STEP 1: Scan bottom-to-top for the UNKNOWN block ---
+  // The last row(s) may NOT be UNKNOWN (e.g. a totals row), so we cannot bail
+  // out early. Instead we use a state machine:
+  //   - While passedUnknown is false : skip non-UNKNOWN trailing rows (continue)
+  //   - Once we hit an UNKNOWN row    : start collecting (passedUnknown = true)
+  //   - Next non-UNKNOWN above block  : break (we have exited the UNKNOWN block)
   const lastRowIndex = rawData.length - 1;
-  const lastUnit = String(rawData[lastRowIndex][0]).trim();
+  let passedUnknown = false;
 
-  if (lastUnit !== "UNKNOWN") {
-    Logger.log("Bottom row is not UNKNOWN. Skipping process.");
-    return;
-  }
-
-  // --- STEP 2: Process contiguous UNKNOWN rows from bottom ---
   for (let i = lastRowIndex; i > 0; i--) {
     const row = rawData[i];
     const unit = String(row[0]).trim();
     const code = String(row[1]).trim();
     const name = String(row[2]).trim();
 
-    if (unit !== "UNKNOWN") break;
+    if (unit !== "UNKNOWN") {
+      if (passedUnknown) break;   // exited the UNKNOWN block going upward
+      continue;                   // still in trailing non-UNKNOWN rows — keep scanning
+    }
 
+    passedUnknown = true;
     if (code && !existingCodes.has(code)) {
       const newRow = new Array(dbHeaders.length).fill("");
       newRow[agentCodeCol] = code;
@@ -254,6 +257,11 @@ function appendUnknownAgentsToDatabase() {
       rowsToMark.push(i + 1);
     }
   }
+
+  Logger.log(passedUnknown
+    ? `Scanned bottom-to-top: found UNKNOWN block, ${rowsToInsert.length} new agent(s).`
+    : "Scanned bottom-to-top: no UNKNOWN rows found in this report."
+  );
 
   // --- STEP 3: Insert into Database ---
   if (rowsToInsert.length > 0) {
@@ -580,8 +588,7 @@ function sendBranchSummaryEmail() {
 
   // First recipient is for testing. Add more to the array as needed.
   const RECIPIENTS = [
-    "jlouisencinas@gmail.com",
-    //  "plukfloroespiritu@gmail.com", "plukruthgutierrez@gmail.com",
+    "jlouisencinas@gmail.com", "plukfloroespiritu@gmail.com", "plukruthgutierrez@gmail.com",
   ];
 
   const NON_BRANCH = new Set(["", "FOR_DB_UPDATE", "UNKNOWN"]);
