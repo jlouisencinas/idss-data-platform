@@ -17,9 +17,16 @@ Design for ~675 agents:
 
 Usage:
   py scripts/audit_terminated.py --recon 5     # find the STATUS label (writes nothing)
-  py scripts/audit_terminated.py               # full audit (resumable)
+  py scripts/audit_terminated.py               # full audit of Database 2026 (resumable)
+  py scripts/audit_terminated.py --queue       # verify ONLY the delisted (*) agents the
+                                               #   Apps Script queued in PENDING_TERMINATION_CHECK
   py scripts/audit_terminated.py --limit 150   # do up to 150 new agents this run
   py scripts/audit_terminated.py --headful     # watch the browser
+
+Typical delisted-agent flow (fast):
+  Apps Script queues starred agents → PENDING_TERMINATION_CHECK (STATUS=PENDING)
+  1) py scripts/audit_terminated.py --queue    # PRISM-verify just those, write TERMINATED_AUDIT
+  2) py scripts/delete_terminated.py --commit  # delete ONLY the ones PRISM says TERMINATED
 
 Prereqs (local .env or env vars):
   SPREADSHEET_ID, SERVICE_ACCOUNT_JSON, PRISM_USERNAME, PRISM_PASSWORD,
@@ -39,7 +46,7 @@ from playwright.sync_api import sync_playwright
 from core import config
 from core.logger import get_logger
 from connectors.gmail_connector import get_otp_gmail_service
-from connectors.sheets_connector import read_range, append_rows, ensure_sheet
+from connectors.sheets_connector import read_range, append_rows, ensure_sheet, batch_update
 from services.prism_service import (
     PrismPage, _do_login, AgentNotFoundInPrismError, SessionExpiredError,
 )
@@ -47,6 +54,7 @@ from services.prism_service import (
 logger = get_logger("audit-terminated")
 
 AUDIT_SHEET = "TERMINATED_AUDIT"
+QUEUE_SHEET = "PENDING_TERMINATION_CHECK"   # queue written by the Apps Script (delisted * agents)
 HEADERS     = ["AGENT CODE", "AGENT NAME", "STATUS", "TERMINATED", "CHECKED_AT"]
 # Status values (uppercase substring) that count as terminated/delisted:
 TERMINATED_KEYWORDS = ("TERMINAT", "RESIGN", "CANCEL")
@@ -77,6 +85,32 @@ def load_done_codes(sid):
     return {str(r[0]).strip() for r in rows[1:] if r and str(r[0]).strip()}
 
 
+def load_queue_agents(sid):
+    """
+    Read PENDING_TERMINATION_CHECK (the delisted-* queue the Apps Script writes).
+    Columns: A=AGENT CODE, B=AGENT NAME, C=STATUS, D=DETECTED_AT.
+    Returns [(agent_code, agent_name, row_number_1indexed)] for STATUS == PENDING rows.
+    """
+    rows = read_range(sid, f"{QUEUE_SHEET}!A:D")
+    if not rows or len(rows) < 2:
+        return []
+    out = []
+    for idx, r in enumerate(rows[1:], start=2):  # row 2 = first data row
+        code   = str(r[0]).strip() if len(r) > 0 else ""
+        name   = str(r[1]).strip() if len(r) > 1 else ""
+        status = str(r[2]).strip().upper() if len(r) > 2 else ""
+        if code and status == "PENDING":
+            out.append((code, name, idx))
+    return out
+
+
+def mark_queue_checked(sid, row_number):
+    """Flip a queue row's STATUS (col C) from PENDING to CHECKED so it drains."""
+    if not row_number:
+        return
+    batch_update(sid, [{"range": f"{QUEUE_SHEET}!C{row_number}", "values": [["CHECKED"]]}])
+
+
 def pick_status(fields: dict):
     """Find the field whose label contains STATUS. Returns (label, value)."""
     for k, v in fields.items():
@@ -85,16 +119,21 @@ def pick_status(fields: dict):
     return None, ""
 
 
-def record(sid, code, name, status, terminated):
+def record(sid, code, name, status, terminated, queue_row=None):
     append_rows(sid, f"{AUDIT_SHEET}!A:E", [[
         code, name, status, "TRUE" if terminated else "FALSE",
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     ]])
+    # In --queue mode, mark this agent CHECKED so it doesn't get re-verified.
+    mark_queue_checked(sid, queue_row)
 
 
 def main():
     ap = argparse.ArgumentParser(description="PRISM termination audit")
     ap.add_argument("--recon", type=int, default=0, help="Dump fields for N agents, write nothing")
+    ap.add_argument("--queue", action="store_true",
+                    help="Verify ONLY agents in PENDING_TERMINATION_CHECK (STATUS=PENDING), "
+                         "then mark each CHECKED")
     ap.add_argument("--limit", type=int, default=0, help="Process up to N new agents this run")
     ap.add_argument("--headful", action="store_true", help="Show the browser window")
     args = ap.parse_args()
@@ -104,15 +143,25 @@ def main():
         logger.error("Missing SPREADSHEET_ID / PRISM_USERNAME / PRISM_PASSWORD.")
         sys.exit(1)
 
-    agents = load_db_agents(sid)
-    logger.info(f"Database agents: {len(agents)}")
+    qrow = {}  # agent_code -> queue row number (only populated in --queue mode)
+    if args.queue:
+        queued = load_queue_agents(sid)
+        agents = [(c, n) for (c, n, _r) in queued]
+        qrow   = {c: _r for (c, n, _r) in queued}
+        logger.info(f"Queue ({QUEUE_SHEET}) PENDING agents: {len(agents)}")
+    else:
+        agents = load_db_agents(sid)
+        logger.info(f"Database agents: {len(agents)}")
 
     if not args.recon:
         ensure_sheet(sid, AUDIT_SHEET, HEADERS)
-        done = load_done_codes(sid)
-        if done:
-            agents = [(c, n) for (c, n) in agents if c not in done]
-            logger.info(f"Skipping {len(done)} already-checked; {len(agents)} remaining.")
+        # In --queue mode the queue's PENDING status controls what runs, so we don't
+        # skip by already-audited codes (an agent may be intentionally re-queued).
+        if not args.queue:
+            done = load_done_codes(sid)
+            if done:
+                agents = [(c, n) for (c, n) in agents if c not in done]
+                logger.info(f"Skipping {len(done)} already-checked; {len(agents)} remaining.")
         if args.limit:
             agents = agents[: args.limit]
             logger.info(f"Limited to {len(agents)} this run.")
@@ -152,14 +201,14 @@ def main():
                     prism.search_agent(code)
                 except AgentNotFoundInPrismError:
                     if not args.recon:
-                        record(sid, code, name, "NOT_FOUND", False)
+                        record(sid, code, name, "NOT_FOUND", False, queue_row=qrow.get(code))
                     notfound += 1
                     logger.info(f"[{i}/{len(agents)}] {code} {name} → NOT_FOUND")
                     continue
 
                 if not prism.has_search_result(code):
                     if not args.recon:
-                        record(sid, code, name, "NOT_FOUND", False)
+                        record(sid, code, name, "NOT_FOUND", False, queue_row=qrow.get(code))
                     notfound += 1
                     logger.info(f"[{i}/{len(agents)}] {code} {name} → NOT_FOUND")
                     continue
@@ -187,7 +236,7 @@ def main():
                     _, status = pick_status(prism.extract_all_fields())
                 status = (status or "UNKNOWN").strip()
                 is_term = any(kw in status.upper() for kw in TERMINATED_KEYWORDS)
-                record(sid, code, name, status, is_term)
+                record(sid, code, name, status, is_term, queue_row=qrow.get(code))
                 checked += 1
                 if is_term:
                     terminated += 1
@@ -204,7 +253,7 @@ def main():
                 errors += 1
                 logger.error(f"{code} ({name}): {e}")
                 if not args.recon:
-                    record(sid, code, name, f"ERROR: {str(e)[:120]}", False)
+                    record(sid, code, name, f"ERROR: {str(e)[:120]}", False, queue_row=qrow.get(code))
                 continue
 
         if not args.recon:

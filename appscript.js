@@ -1,6 +1,10 @@
 // ============================================================
 //  LKL DATABASE AUTOMATION — Google Apps Script
 //  Updated: added PENDING_PRISM_UPDATE queue for new agents
+//  Updated: delisted (*) agents are QUEUED for PRISM verification
+//           (PENDING_TERMINATION_CHECK) instead of being deleted.
+//           Deletion happens only after PRISM confirms termination,
+//           via scripts/audit_terminated.py + scripts/delete_terminated.py.
 // ============================================================
 
 function doPost(e) {
@@ -11,7 +15,7 @@ function doPost(e) {
 function processAndFreezeProductionData() {
   Logger.log("Starting full process...");
   updateUnitColumnFromDatabase();
-  deleteDelistedAgents();          // remove agents marked "*" (delisted) from Database
+  queueDelistedAgents();           // queue agents marked "*" for PRISM verification (NON-destructive)
   appendUnknownAgentsToDatabase();
   freezeCurrentMonthValues();
   freezeMonthlyRecCount();
@@ -113,102 +117,99 @@ function updateUnitColumnFromDatabase() {
 }
 
 /* =====================================================
-   STEP 1b: Delete DELISTED agents from Database 2026.
-   Agents whose name ends with "*" in the report are
-   delisted. We detect them in CLEANED_RAW (col C = AGENT
-   NAME, col B = AGENT CODE) and delete their entire row
-   from Database 2026, matching by AGENT CODE (falling
-   back to AGENT NAME when the code is blank).
-   Rows are deleted bottom-to-top so indices don't shift.
+   STEP 1b: QUEUE delisted (*) agents for PRISM verification.
+
+   Agents whose name ends with "*" in the IDSS report are
+   *delisted candidates* — but the "*" alone is NOT proof of
+   termination (active, producing agents can be starred). So
+   this step NEVER deletes. It only collects the starred agents
+   from CLEANED_RAW (col B = AGENT CODE, col C = AGENT NAME) and
+   appends them to the PENDING_TERMINATION_CHECK queue.
+
+   The actual verification + deletion happen out-of-band, where
+   PRISM (OTP-gated) can be driven:
+     1. scripts/audit_terminated.py --queue
+          → looks up each queued agent in PRISM, records STATUS
+            in TERMINATED_AUDIT (TERMINATED=TRUE only when PRISM
+            status is TERMINATED/RESIGNED/CANCELLED), marks the
+            queue row CHECKED.
+     2. scripts/delete_terminated.py --commit
+          → deletes from Database 2026 ONLY the rows PRISM
+            confirmed as TERMINATED. Dry-run by default.
+
+   Queue columns: A=AGENT CODE, B=AGENT NAME, C=STATUS, D=DETECTED_AT
+   Entries are deduped by AGENT CODE so re-runs don't pile up.
 ===================================================== */
-function deleteDelistedAgents() {
-  Logger.log("Checking for delisted (*) agents...");
+function queueDelistedAgents() {
+  Logger.log("Queuing delisted (*) agents for PRISM verification...");
+
+  const QUEUE_NAME = "PENDING_TERMINATION_CHECK";
 
   const ss       = SpreadsheetApp.getActiveSpreadsheet();
   const rawSheet = ss.getSheetByName("CLEANED_RAW");
-  const dbSheet  = ss.getSheetByName("Database 2026");
 
-  if (!rawSheet || !dbSheet) {
-    Logger.log("deleteDelistedAgents: required sheets missing — skipping.");
+  if (!rawSheet) {
+    Logger.log("queueDelistedAgents: CLEANED_RAW missing — skipping.");
     return;
   }
 
-  // ── 1. Collect delisted codes + names from CLEANED_RAW ─────────────────────
+  // ── 1. Collect starred (delisted-candidate) agents from CLEANED_RAW ─────────
   // CLEANED_RAW columns: A=UNIT(0), B=AGENT CODE(1), C=AGENT NAME(2)
-  const rawData = rawSheet.getDataRange().getValues();
+  const rawData   = rawSheet.getDataRange().getValues();
   const stripStar = function (s) {
-    return String(s).trim().replace(/\s*\*+\s*$/, "").trim().toUpperCase();
+    return String(s).trim().replace(/\s*\*+\s*$/, "").trim();
   };
 
-  const delistedCodes = {};  // normalized code -> true
-  const delistedNames = {};  // normalized name (no *) -> true
+  const delisted = [];   // [{code, name}]
+  const seen     = {};   // code -> true (dedupe within this report)
 
   for (var i = 1; i < rawData.length; i++) {
     var nameCell = String(rawData[i][2]).trim();
-    if (!nameCell || !/\*\s*$/.test(nameCell)) continue;  // only names ending with *
+    if (!nameCell || !/\*\s*$/.test(nameCell)) continue;   // only names ending with *
     var code = String(rawData[i][1]).trim();
-    if (code) delistedCodes[code] = true;
-    delistedNames[stripStar(nameCell)] = true;
+    if (!code || seen[code]) continue;                     // need a code to verify in PRISM
+    seen[code] = true;
+    delisted.push({ code: code, name: stripStar(nameCell) });
   }
 
-  var totalFlagged = Object.keys(delistedCodes).length + Object.keys(delistedNames).length;
-  if (Object.keys(delistedNames).length === 0) {
-    Logger.log("deleteDelistedAgents: no delisted (*) agents in this report.");
-    return;
-  }
-  Logger.log("deleteDelistedAgents: delisted codes=" +
-    JSON.stringify(Object.keys(delistedCodes)) +
-    " names=" + JSON.stringify(Object.keys(delistedNames)));
-
-  // ── 2. Find matching rows in Database 2026 ─────────────────────────────────
-  const dbData      = dbSheet.getDataRange().getValues();
-  const dbHeaders   = dbData[0];
-  const agentCodeCol = dbHeaders.indexOf("AGENT CODE");
-  const agentNameCol = dbHeaders.indexOf("AGENT NAME");
-
-  if (agentCodeCol === -1 || agentNameCol === -1) {
-    Logger.log("deleteDelistedAgents: AGENT CODE/NAME column missing — skipping.");
+  if (delisted.length === 0) {
+    Logger.log("queueDelistedAgents: no delisted (*) agents in this report.");
     return;
   }
 
-  const rowsToDelete = [];  // 1-indexed sheet rows
-  for (var r = 1; r < dbData.length; r++) {
-    var dbCode = String(dbData[r][agentCodeCol]).trim();
-    var dbName = stripStar(dbData[r][agentNameCol]);
-    if ((dbCode && delistedCodes[dbCode]) || (dbName && delistedNames[dbName])) {
-      rowsToDelete.push(r + 1);  // +1 → 1-indexed sheet row
-    }
+  // ── 2. Ensure the queue sheet + header ─────────────────────────────────────
+  var queueSheet = ss.getSheetByName(QUEUE_NAME);
+  if (!queueSheet) queueSheet = ss.insertSheet(QUEUE_NAME);
+  if (queueSheet.getLastRow() === 0) {
+    queueSheet.getRange(1, 1, 1, 4)
+      .setValues([["AGENT CODE", "AGENT NAME", "STATUS", "DETECTED_AT"]])
+      .setBackground("#c9000a").setFontColor("#ffffff").setFontWeight("bold");
   }
 
-  if (rowsToDelete.length === 0) {
-    Logger.log("deleteDelistedAgents: no matching Database rows (already removed?).");
+  // ── 3. Dedupe against codes already in the queue ───────────────────────────
+  const existing = {};
+  const qData    = queueSheet.getDataRange().getValues();
+  for (var q = 1; q < qData.length; q++) {
+    var qc = String(qData[q][0]).trim();
+    if (qc) existing[qc] = true;
+  }
+
+  const now = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss");
+  const toAppend = delisted
+    .filter(function (a) { return !existing[a.code]; })
+    .map(function (a) { return [a.code, a.name, "PENDING", now]; });
+
+  if (toAppend.length === 0) {
+    Logger.log("queueDelistedAgents: all " + delisted.length +
+      " starred agent(s) already queued — nothing new. NO rows deleted.");
     return;
   }
 
-  // ── 3. Delete bottom-to-top so row indices don't shift ─────────────────────
-  rowsToDelete.sort(function (a, b) { return b - a; });
-  rowsToDelete.forEach(function (rowNum) { dbSheet.deleteRow(rowNum); });
+  queueSheet.getRange(queueSheet.getLastRow() + 1, 1, toAppend.length, 4).setValues(toAppend);
 
-  Logger.log("deleteDelistedAgents: deleted " + rowsToDelete.length +
-    " row(s) from Database 2026 (flagged " + Object.keys(delistedNames).length + " agent(s)).");
-
-  // ── 4. Also purge delisted agents from PENDING_PRISM_UPDATE ────────────────
-  // They may have been queued by a prior run before they were delisted.
-  const pendingSheet = ss.getSheetByName("PENDING_PRISM_UPDATE");
-  if (pendingSheet) {
-    const pendingData = pendingSheet.getDataRange().getValues();
-    const pendingRowsToDrop = [];
-    for (var p = 1; p < pendingData.length; p++) {
-      var pCode = String(pendingData[p][0]).trim();
-      if (pCode && delistedCodes[pCode]) pendingRowsToDrop.push(p + 1);
-    }
-    if (pendingRowsToDrop.length > 0) {
-      pendingRowsToDrop.sort(function (a, b) { return b - a; });
-      pendingRowsToDrop.forEach(function (r) { pendingSheet.deleteRow(r); });
-      Logger.log("deleteDelistedAgents: removed " + pendingRowsToDrop.length +
-        " delisted agent(s) from PENDING_PRISM_UPDATE.");
-    }
-  }
+  Logger.log("queueDelistedAgents: queued " + toAppend.length + " new delisted candidate(s) in " +
+    QUEUE_NAME + " (" + delisted.length + " starred this report). " +
+    "Run scripts/audit_terminated.py --queue to verify in PRISM. NO rows deleted.");
 }
 
 /* =====================================================
