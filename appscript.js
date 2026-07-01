@@ -19,6 +19,7 @@ function processAndFreezeProductionData() {
   appendUnknownAgentsToDatabase();
   freezeCurrentMonthValues();
   freezeMonthlyRecCount();
+  buildBranchApeReconciliation();  // reconcile Database <MONTH> APE vs CLEANED_RAW MTD APE per branch
   sendBranchSummaryEmail();
   Logger.log("All steps completed.");
 }
@@ -607,6 +608,157 @@ function freezeMonthlyRecCount() {
 }
 
 /* =====================================================
+   STEP 3c: BRANCH APE reconciliation (Database vs CLEANED_RAW).
+
+   Builds/refreshes a "BRANCH_APE_RECON" sheet comparing, per BRANCH:
+     • DB <MONTH> APE  = sum of the frozen "<MONTH> APE" column in Database 2026
+     • RAW MTD APE     = sum of "MTD APE" in CLEANED_RAW for the same agents
+     • DIFF            = DB − RAW  (0 means the freeze matches the raw report)
+
+   CLEANED_RAW has no BRANCH column, so each raw row is attributed to a branch
+   via its AGENT CODE → BRANCH mapping from Database 2026. Raw agents with no
+   matching Database row are bucketed as "(unmatched)" so the column totals
+   still tie out and explain any gap. Rows are sorted by |DIFF| so mismatches
+   surface at the top; non-zero diffs are highlighted.
+
+   Month is detected from CLEANED_RAW!O1 (same source the freeze steps use).
+   Read-only against source data — only writes the recon sheet.
+===================================================== */
+function buildBranchApeReconciliation() {
+  Logger.log("Starting buildBranchApeReconciliation");
+
+  const RECON_SHEET = "BRANCH_APE_RECON";
+
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const dbSheet  = ss.getSheetByName("Database 2026");
+  const rawSheet = ss.getSheetByName("CLEANED_RAW");
+
+  if (!dbSheet || !rawSheet) {
+    Logger.log("buildBranchApeReconciliation: required sheets missing — skipping.");
+    return;
+  }
+
+  // ── Detect month (same source as the freeze steps) ──────────────────────────
+  const rawDate = rawSheet.getRange("O1").getValue();
+  if (!(rawDate instanceof Date)) {
+    Logger.log("buildBranchApeReconciliation: CLEANED_RAW!O1 is not a date — skipping.");
+    return;
+  }
+  const tz    = ss.getSpreadsheetTimeZone();
+  const month = Utilities.formatDate(rawDate, tz, "MMM").toUpperCase();   // e.g. "JUN"
+
+  const num = function (v) {
+    const n = parseFloat(String(v).replace(/,/g, ""));
+    return isNaN(n) ? 0 : n;
+  };
+
+  // ── Database side: locate columns, build code→branch map + DB totals ────────
+  const dbData    = dbSheet.getDataRange().getValues();
+  const dbHeaders = dbData[0];
+  const branchCol = dbHeaders.indexOf("BRANCH");
+  const dbCodeCol = dbHeaders.indexOf("AGENT CODE");
+  const dbApeCol  = dbHeaders.indexOf(month + " APE");
+
+  if (branchCol === -1 || dbCodeCol === -1 || dbApeCol === -1) {
+    Logger.log("buildBranchApeReconciliation: missing Database column(s) — " +
+      "BRANCH=" + branchCol + ", AGENT CODE=" + dbCodeCol + ", " + month + " APE=" + dbApeCol +
+      " — skipping.");
+    return;
+  }
+
+  const codeToBranch = {};                 // agent code -> branch
+  const dbTotals     = {};                 // branch -> { ape }
+  for (var i = 1; i < dbData.length; i++) {
+    var code   = String(dbData[i][dbCodeCol]).trim();
+    var branch = String(dbData[i][branchCol]).trim() || "(blank)";
+    if (code) codeToBranch[code] = branch;
+    if (!dbTotals[branch]) dbTotals[branch] = { ape: 0 };
+    dbTotals[branch].ape += num(dbData[i][dbApeCol]);
+  }
+
+  // ── CLEANED_RAW side: locate columns, build RAW totals per (mapped) branch ──
+  const rawData    = rawSheet.getDataRange().getValues();
+  const rawHeaders = rawData[0];
+  var rawCodeCol   = rawHeaders.indexOf("AGENT CODE");
+  var rawApeCol    = rawHeaders.indexOf("MTD APE");
+  if (rawCodeCol === -1) rawCodeCol = 1;   // CLEANED_RAW layout fallback: B = AGENT CODE
+  if (rawApeCol  === -1) rawApeCol  = 6;   // CLEANED_RAW layout fallback: G = MTD APE
+
+  const rawTotals = {};                    // branch -> { ape }
+  for (var r = 1; r < rawData.length; r++) {
+    var rCode = String(rawData[r][rawCodeCol]).trim();
+    if (!rCode) continue;
+    var rBranch = codeToBranch[rCode] || "(unmatched)";
+    if (!rawTotals[rBranch]) rawTotals[rBranch] = { ape: 0 };
+    rawTotals[rBranch].ape += num(rawData[r][rawApeCol]);
+  }
+
+  // ── Merge branches, compute diffs ───────────────────────────────────────────
+  const branches = {};
+  Object.keys(dbTotals).forEach(function (b) { branches[b] = true; });
+  Object.keys(rawTotals).forEach(function (b) { branches[b] = true; });
+
+  const rows = Object.keys(branches).map(function (b) {
+    var db  = dbTotals[b]  || { ape: 0 };
+    var raw = rawTotals[b] || { ape: 0 };
+    return {
+      branch: b,
+      dbApe:  db.ape,
+      rawApe: raw.ape,
+      diff:   db.ape - raw.ape,
+    };
+  });
+
+  // Sort by |DIFF| desc so mismatches float to the top, then by branch name.
+  rows.sort(function (a, b) {
+    var d = Math.abs(b.diff) - Math.abs(a.diff);
+    return d !== 0 ? d : (a.branch < b.branch ? -1 : 1);
+  });
+
+  // ── Write the recon sheet ───────────────────────────────────────────────────
+  var reconSheet = ss.getSheetByName(RECON_SHEET);
+  if (!reconSheet) reconSheet = ss.insertSheet(RECON_SHEET);
+  reconSheet.clearContents();
+  reconSheet.clearFormats();
+
+  const header = ["BRANCH",
+                  "DB " + month + " APE", "RAW MTD APE", "DIFF (DB - RAW)"];
+  const out = [header];
+
+  var totDb = 0, totRaw = 0;
+  rows.forEach(function (x) {
+    out.push([x.branch, x.dbApe, x.rawApe, x.diff]);
+    totDb  += x.dbApe;
+    totRaw += x.rawApe;
+  });
+  out.push(["TOTAL", totDb, totRaw, totDb - totRaw]);
+
+  reconSheet.getRange(1, 1, out.length, header.length).setValues(out);
+
+  // Formatting: header, number formats, TOTAL row, and highlight non-zero diffs
+  const lastRow = out.length;
+  reconSheet.getRange(1, 1, 1, header.length)
+    .setBackground("#1B3A8C").setFontColor("#ffffff").setFontWeight("bold");
+  reconSheet.getRange(2, 2, lastRow - 1, 3).setNumberFormat("#,##0.00");   // APE cols
+  reconSheet.getRange(lastRow, 1, 1, header.length)
+    .setFontWeight("bold").setBackground("#EEF2F7");
+
+  for (var k = 0; k < rows.length; k++) {
+    if (Math.round(rows[k].diff * 100) !== 0) {
+      reconSheet.getRange(k + 2, 1, 1, header.length).setBackground("#fde2e1");
+    }
+  }
+  reconSheet.setFrozenRows(1);
+  reconSheet.autoResizeColumns(1, header.length);
+
+  var mismatches = rows.filter(function (x) { return Math.round(x.diff * 100) !== 0; }).length;
+  Logger.log("buildBranchApeReconciliation: wrote " + rows.length + " branch row(s) to " +
+    RECON_SHEET + "; " + mismatches + " with a non-zero DIFF. " +
+    "DB total=" + totDb.toFixed(2) + " vs RAW total=" + totRaw.toFixed(2) +
+    " (diff " + (totDb - totRaw).toFixed(2) + ").");
+}
+
+/* =====================================================
    STEP 4: Email the branch production summary
    Ranked by MTD APE. Computed from Database 2026 using
    the current report month detected from CLEANED_RAW!O1.
@@ -969,6 +1121,15 @@ function sendBranchSummaryEmail() {
 ===================================================== */
 function testBranchSummaryEmail() {
   sendBranchSummaryEmail();
+}
+
+/* =====================================================
+   TEST: Build the BRANCH_APE_RECON sheet on demand without
+   running the full pipeline. Requires CLEANED_RAW + Database
+   2026 to hold current data (O1 date populated, month frozen).
+===================================================== */
+function testBranchApeReconciliation() {
+  buildBranchApeReconciliation();
 }
 
 /* =====================================================
