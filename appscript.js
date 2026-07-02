@@ -1,6 +1,10 @@
 // ============================================================
 //  LKL DATABASE AUTOMATION — Google Apps Script
 //  Updated: added PENDING_PRISM_UPDATE queue for new agents
+//  Updated: delisted (*) agents are QUEUED for PRISM verification
+//           (PENDING_TERMINATION_CHECK) instead of being deleted.
+//           Deletion happens only after PRISM confirms termination,
+//           via scripts/audit_terminated.py + scripts/delete_terminated.py.
 // ============================================================
 
 function doPost(e) {
@@ -11,10 +15,11 @@ function doPost(e) {
 function processAndFreezeProductionData() {
   Logger.log("Starting full process...");
   updateUnitColumnFromDatabase();
-  deleteDelistedAgents();          // remove agents marked "*" (delisted) from Database
+  queueDelistedAgents();           // queue agents marked "*" for PRISM verification (NON-destructive)
   appendUnknownAgentsToDatabase();
   freezeCurrentMonthValues();
   freezeMonthlyRecCount();
+  buildBranchApeReconciliation();  // reconcile Database <MONTH> APE vs CLEANED_RAW MTD APE per branch
   sendBranchSummaryEmail();
   Logger.log("All steps completed.");
 }
@@ -113,102 +118,99 @@ function updateUnitColumnFromDatabase() {
 }
 
 /* =====================================================
-   STEP 1b: Delete DELISTED agents from Database 2026.
-   Agents whose name ends with "*" in the report are
-   delisted. We detect them in CLEANED_RAW (col C = AGENT
-   NAME, col B = AGENT CODE) and delete their entire row
-   from Database 2026, matching by AGENT CODE (falling
-   back to AGENT NAME when the code is blank).
-   Rows are deleted bottom-to-top so indices don't shift.
+   STEP 1b: QUEUE delisted (*) agents for PRISM verification.
+
+   Agents whose name ends with "*" in the IDSS report are
+   *delisted candidates* — but the "*" alone is NOT proof of
+   termination (active, producing agents can be starred). So
+   this step NEVER deletes. It only collects the starred agents
+   from CLEANED_RAW (col B = AGENT CODE, col C = AGENT NAME) and
+   appends them to the PENDING_TERMINATION_CHECK queue.
+
+   The actual verification + deletion happen out-of-band, where
+   PRISM (OTP-gated) can be driven:
+     1. scripts/audit_terminated.py --queue
+          → looks up each queued agent in PRISM, records STATUS
+            in TERMINATED_AUDIT (TERMINATED=TRUE only when PRISM
+            status is TERMINATED/RESIGNED/CANCELLED), marks the
+            queue row CHECKED.
+     2. scripts/delete_terminated.py --commit
+          → deletes from Database 2026 ONLY the rows PRISM
+            confirmed as TERMINATED. Dry-run by default.
+
+   Queue columns: A=AGENT CODE, B=AGENT NAME, C=STATUS, D=DETECTED_AT
+   Entries are deduped by AGENT CODE so re-runs don't pile up.
 ===================================================== */
-function deleteDelistedAgents() {
-  Logger.log("Checking for delisted (*) agents...");
+function queueDelistedAgents() {
+  Logger.log("Queuing delisted (*) agents for PRISM verification...");
+
+  const QUEUE_NAME = "PENDING_TERMINATION_CHECK";
 
   const ss       = SpreadsheetApp.getActiveSpreadsheet();
   const rawSheet = ss.getSheetByName("CLEANED_RAW");
-  const dbSheet  = ss.getSheetByName("Database 2026");
 
-  if (!rawSheet || !dbSheet) {
-    Logger.log("deleteDelistedAgents: required sheets missing — skipping.");
+  if (!rawSheet) {
+    Logger.log("queueDelistedAgents: CLEANED_RAW missing — skipping.");
     return;
   }
 
-  // ── 1. Collect delisted codes + names from CLEANED_RAW ─────────────────────
+  // ── 1. Collect starred (delisted-candidate) agents from CLEANED_RAW ─────────
   // CLEANED_RAW columns: A=UNIT(0), B=AGENT CODE(1), C=AGENT NAME(2)
-  const rawData = rawSheet.getDataRange().getValues();
+  const rawData   = rawSheet.getDataRange().getValues();
   const stripStar = function (s) {
-    return String(s).trim().replace(/\s*\*+\s*$/, "").trim().toUpperCase();
+    return String(s).trim().replace(/\s*\*+\s*$/, "").trim();
   };
 
-  const delistedCodes = {};  // normalized code -> true
-  const delistedNames = {};  // normalized name (no *) -> true
+  const delisted = [];   // [{code, name}]
+  const seen     = {};   // code -> true (dedupe within this report)
 
   for (var i = 1; i < rawData.length; i++) {
     var nameCell = String(rawData[i][2]).trim();
-    if (!nameCell || !/\*\s*$/.test(nameCell)) continue;  // only names ending with *
+    if (!nameCell || !/\*\s*$/.test(nameCell)) continue;   // only names ending with *
     var code = String(rawData[i][1]).trim();
-    if (code) delistedCodes[code] = true;
-    delistedNames[stripStar(nameCell)] = true;
+    if (!code || seen[code]) continue;                     // need a code to verify in PRISM
+    seen[code] = true;
+    delisted.push({ code: code, name: stripStar(nameCell) });
   }
 
-  var totalFlagged = Object.keys(delistedCodes).length + Object.keys(delistedNames).length;
-  if (Object.keys(delistedNames).length === 0) {
-    Logger.log("deleteDelistedAgents: no delisted (*) agents in this report.");
-    return;
-  }
-  Logger.log("deleteDelistedAgents: delisted codes=" +
-    JSON.stringify(Object.keys(delistedCodes)) +
-    " names=" + JSON.stringify(Object.keys(delistedNames)));
-
-  // ── 2. Find matching rows in Database 2026 ─────────────────────────────────
-  const dbData      = dbSheet.getDataRange().getValues();
-  const dbHeaders   = dbData[0];
-  const agentCodeCol = dbHeaders.indexOf("AGENT CODE");
-  const agentNameCol = dbHeaders.indexOf("AGENT NAME");
-
-  if (agentCodeCol === -1 || agentNameCol === -1) {
-    Logger.log("deleteDelistedAgents: AGENT CODE/NAME column missing — skipping.");
+  if (delisted.length === 0) {
+    Logger.log("queueDelistedAgents: no delisted (*) agents in this report.");
     return;
   }
 
-  const rowsToDelete = [];  // 1-indexed sheet rows
-  for (var r = 1; r < dbData.length; r++) {
-    var dbCode = String(dbData[r][agentCodeCol]).trim();
-    var dbName = stripStar(dbData[r][agentNameCol]);
-    if ((dbCode && delistedCodes[dbCode]) || (dbName && delistedNames[dbName])) {
-      rowsToDelete.push(r + 1);  // +1 → 1-indexed sheet row
-    }
+  // ── 2. Ensure the queue sheet + header ─────────────────────────────────────
+  var queueSheet = ss.getSheetByName(QUEUE_NAME);
+  if (!queueSheet) queueSheet = ss.insertSheet(QUEUE_NAME);
+  if (queueSheet.getLastRow() === 0) {
+    queueSheet.getRange(1, 1, 1, 4)
+      .setValues([["AGENT CODE", "AGENT NAME", "STATUS", "DETECTED_AT"]])
+      .setBackground("#c9000a").setFontColor("#ffffff").setFontWeight("bold");
   }
 
-  if (rowsToDelete.length === 0) {
-    Logger.log("deleteDelistedAgents: no matching Database rows (already removed?).");
+  // ── 3. Dedupe against codes already in the queue ───────────────────────────
+  const existing = {};
+  const qData    = queueSheet.getDataRange().getValues();
+  for (var q = 1; q < qData.length; q++) {
+    var qc = String(qData[q][0]).trim();
+    if (qc) existing[qc] = true;
+  }
+
+  const now = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss");
+  const toAppend = delisted
+    .filter(function (a) { return !existing[a.code]; })
+    .map(function (a) { return [a.code, a.name, "PENDING", now]; });
+
+  if (toAppend.length === 0) {
+    Logger.log("queueDelistedAgents: all " + delisted.length +
+      " starred agent(s) already queued — nothing new. NO rows deleted.");
     return;
   }
 
-  // ── 3. Delete bottom-to-top so row indices don't shift ─────────────────────
-  rowsToDelete.sort(function (a, b) { return b - a; });
-  rowsToDelete.forEach(function (rowNum) { dbSheet.deleteRow(rowNum); });
+  queueSheet.getRange(queueSheet.getLastRow() + 1, 1, toAppend.length, 4).setValues(toAppend);
 
-  Logger.log("deleteDelistedAgents: deleted " + rowsToDelete.length +
-    " row(s) from Database 2026 (flagged " + Object.keys(delistedNames).length + " agent(s)).");
-
-  // ── 4. Also purge delisted agents from PENDING_PRISM_UPDATE ────────────────
-  // They may have been queued by a prior run before they were delisted.
-  const pendingSheet = ss.getSheetByName("PENDING_PRISM_UPDATE");
-  if (pendingSheet) {
-    const pendingData = pendingSheet.getDataRange().getValues();
-    const pendingRowsToDrop = [];
-    for (var p = 1; p < pendingData.length; p++) {
-      var pCode = String(pendingData[p][0]).trim();
-      if (pCode && delistedCodes[pCode]) pendingRowsToDrop.push(p + 1);
-    }
-    if (pendingRowsToDrop.length > 0) {
-      pendingRowsToDrop.sort(function (a, b) { return b - a; });
-      pendingRowsToDrop.forEach(function (r) { pendingSheet.deleteRow(r); });
-      Logger.log("deleteDelistedAgents: removed " + pendingRowsToDrop.length +
-        " delisted agent(s) from PENDING_PRISM_UPDATE.");
-    }
-  }
+  Logger.log("queueDelistedAgents: queued " + toAppend.length + " new delisted candidate(s) in " +
+    QUEUE_NAME + " (" + delisted.length + " starred this report). " +
+    "Run scripts/audit_terminated.py --queue to verify in PRISM. NO rows deleted.");
 }
 
 /* =====================================================
@@ -606,6 +608,157 @@ function freezeMonthlyRecCount() {
 }
 
 /* =====================================================
+   STEP 3c: BRANCH APE reconciliation (Database vs CLEANED_RAW).
+
+   Builds/refreshes a "BRANCH_APE_RECON" sheet comparing, per BRANCH:
+     • DB <MONTH> APE  = sum of the frozen "<MONTH> APE" column in Database 2026
+     • RAW MTD APE     = sum of "MTD APE" in CLEANED_RAW for the same agents
+     • DIFF            = DB − RAW  (0 means the freeze matches the raw report)
+
+   CLEANED_RAW has no BRANCH column, so each raw row is attributed to a branch
+   via its AGENT CODE → BRANCH mapping from Database 2026. Raw agents with no
+   matching Database row are bucketed as "(unmatched)" so the column totals
+   still tie out and explain any gap. Rows are sorted by |DIFF| so mismatches
+   surface at the top; non-zero diffs are highlighted.
+
+   Month is detected from CLEANED_RAW!O1 (same source the freeze steps use).
+   Read-only against source data — only writes the recon sheet.
+===================================================== */
+function buildBranchApeReconciliation() {
+  Logger.log("Starting buildBranchApeReconciliation");
+
+  const RECON_SHEET = "BRANCH_APE_RECON";
+
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const dbSheet  = ss.getSheetByName("Database 2026");
+  const rawSheet = ss.getSheetByName("CLEANED_RAW");
+
+  if (!dbSheet || !rawSheet) {
+    Logger.log("buildBranchApeReconciliation: required sheets missing — skipping.");
+    return;
+  }
+
+  // ── Detect month (same source as the freeze steps) ──────────────────────────
+  const rawDate = rawSheet.getRange("O1").getValue();
+  if (!(rawDate instanceof Date)) {
+    Logger.log("buildBranchApeReconciliation: CLEANED_RAW!O1 is not a date — skipping.");
+    return;
+  }
+  const tz    = ss.getSpreadsheetTimeZone();
+  const month = Utilities.formatDate(rawDate, tz, "MMM").toUpperCase();   // e.g. "JUN"
+
+  const num = function (v) {
+    const n = parseFloat(String(v).replace(/,/g, ""));
+    return isNaN(n) ? 0 : n;
+  };
+
+  // ── Database side: locate columns, build code→branch map + DB totals ────────
+  const dbData    = dbSheet.getDataRange().getValues();
+  const dbHeaders = dbData[0];
+  const branchCol = dbHeaders.indexOf("BRANCH");
+  const dbCodeCol = dbHeaders.indexOf("AGENT CODE");
+  const dbApeCol  = dbHeaders.indexOf(month + " APE");
+
+  if (branchCol === -1 || dbCodeCol === -1 || dbApeCol === -1) {
+    Logger.log("buildBranchApeReconciliation: missing Database column(s) — " +
+      "BRANCH=" + branchCol + ", AGENT CODE=" + dbCodeCol + ", " + month + " APE=" + dbApeCol +
+      " — skipping.");
+    return;
+  }
+
+  const codeToBranch = {};                 // agent code -> branch
+  const dbTotals     = {};                 // branch -> { ape }
+  for (var i = 1; i < dbData.length; i++) {
+    var code   = String(dbData[i][dbCodeCol]).trim();
+    var branch = String(dbData[i][branchCol]).trim() || "(blank)";
+    if (code) codeToBranch[code] = branch;
+    if (!dbTotals[branch]) dbTotals[branch] = { ape: 0 };
+    dbTotals[branch].ape += num(dbData[i][dbApeCol]);
+  }
+
+  // ── CLEANED_RAW side: locate columns, build RAW totals per (mapped) branch ──
+  const rawData    = rawSheet.getDataRange().getValues();
+  const rawHeaders = rawData[0];
+  var rawCodeCol   = rawHeaders.indexOf("AGENT CODE");
+  var rawApeCol    = rawHeaders.indexOf("MTD APE");
+  if (rawCodeCol === -1) rawCodeCol = 1;   // CLEANED_RAW layout fallback: B = AGENT CODE
+  if (rawApeCol  === -1) rawApeCol  = 6;   // CLEANED_RAW layout fallback: G = MTD APE
+
+  const rawTotals = {};                    // branch -> { ape }
+  for (var r = 1; r < rawData.length; r++) {
+    var rCode = String(rawData[r][rawCodeCol]).trim();
+    if (!rCode) continue;
+    var rBranch = codeToBranch[rCode] || "(unmatched)";
+    if (!rawTotals[rBranch]) rawTotals[rBranch] = { ape: 0 };
+    rawTotals[rBranch].ape += num(rawData[r][rawApeCol]);
+  }
+
+  // ── Merge branches, compute diffs ───────────────────────────────────────────
+  const branches = {};
+  Object.keys(dbTotals).forEach(function (b) { branches[b] = true; });
+  Object.keys(rawTotals).forEach(function (b) { branches[b] = true; });
+
+  const rows = Object.keys(branches).map(function (b) {
+    var db  = dbTotals[b]  || { ape: 0 };
+    var raw = rawTotals[b] || { ape: 0 };
+    return {
+      branch: b,
+      dbApe:  db.ape,
+      rawApe: raw.ape,
+      diff:   db.ape - raw.ape,
+    };
+  });
+
+  // Sort by |DIFF| desc so mismatches float to the top, then by branch name.
+  rows.sort(function (a, b) {
+    var d = Math.abs(b.diff) - Math.abs(a.diff);
+    return d !== 0 ? d : (a.branch < b.branch ? -1 : 1);
+  });
+
+  // ── Write the recon sheet ───────────────────────────────────────────────────
+  var reconSheet = ss.getSheetByName(RECON_SHEET);
+  if (!reconSheet) reconSheet = ss.insertSheet(RECON_SHEET);
+  reconSheet.clearContents();
+  reconSheet.clearFormats();
+
+  const header = ["BRANCH",
+                  "DB " + month + " APE", "RAW MTD APE", "DIFF (DB - RAW)"];
+  const out = [header];
+
+  var totDb = 0, totRaw = 0;
+  rows.forEach(function (x) {
+    out.push([x.branch, x.dbApe, x.rawApe, x.diff]);
+    totDb  += x.dbApe;
+    totRaw += x.rawApe;
+  });
+  out.push(["TOTAL", totDb, totRaw, totDb - totRaw]);
+
+  reconSheet.getRange(1, 1, out.length, header.length).setValues(out);
+
+  // Formatting: header, number formats, TOTAL row, and highlight non-zero diffs
+  const lastRow = out.length;
+  reconSheet.getRange(1, 1, 1, header.length)
+    .setBackground("#1B3A8C").setFontColor("#ffffff").setFontWeight("bold");
+  reconSheet.getRange(2, 2, lastRow - 1, 3).setNumberFormat("#,##0.00");   // APE cols
+  reconSheet.getRange(lastRow, 1, 1, header.length)
+    .setFontWeight("bold").setBackground("#EEF2F7");
+
+  for (var k = 0; k < rows.length; k++) {
+    if (Math.round(rows[k].diff * 100) !== 0) {
+      reconSheet.getRange(k + 2, 1, 1, header.length).setBackground("#fde2e1");
+    }
+  }
+  reconSheet.setFrozenRows(1);
+  reconSheet.autoResizeColumns(1, header.length);
+
+  var mismatches = rows.filter(function (x) { return Math.round(x.diff * 100) !== 0; }).length;
+  Logger.log("buildBranchApeReconciliation: wrote " + rows.length + " branch row(s) to " +
+    RECON_SHEET + "; " + mismatches + " with a non-zero DIFF. " +
+    "DB total=" + totDb.toFixed(2) + " vs RAW total=" + totRaw.toFixed(2) +
+    " (diff " + (totDb - totRaw).toFixed(2) + ").");
+}
+
+/* =====================================================
    STEP 4: Email the branch production summary
    Ranked by MTD APE. Computed from Database 2026 using
    the current report month detected from CLEANED_RAW!O1.
@@ -968,6 +1121,15 @@ function sendBranchSummaryEmail() {
 ===================================================== */
 function testBranchSummaryEmail() {
   sendBranchSummaryEmail();
+}
+
+/* =====================================================
+   TEST: Build the BRANCH_APE_RECON sheet on demand without
+   running the full pipeline. Requires CLEANED_RAW + Database
+   2026 to hold current data (O1 date populated, month frozen).
+===================================================== */
+function testBranchApeReconciliation() {
+  buildBranchApeReconciliation();
 }
 
 /* =====================================================
